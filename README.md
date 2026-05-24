@@ -1,10 +1,53 @@
-# WireOS
+# WireOS - Vector Minimal Hardware Edition
 
-**The main repo for WireOS.**
+> [!NOTE]
+> This repository is a heavily modified fork of [os-vector/wire-os](https://github.com/os-vector/wire-os) dedicated to the development of a **minimal hardware-only OS image** and companion control tools for the Anki Vector robot. 
 
-WireOS serves as a nice, stable, and maintained base for custom Anki Vector firmware.
+This fork strips away all Anki proprietary runtime, personality, and cloud systems (no `victor`, `vic-*`, `wired`, or `anki-robot-target`), exposing a clean, raw embedded Linux OS. The robot's hardware peripherals are exposed through the lightweight `vector-hw-api` server, enabling direct low-level control over LAN.
 
-This builds the OS, the /anki programs (`wire-os-victor`), and puts it all into a final OTA. This repo can be thought of as `wire-os-oelinux`.
+---
+
+## 🚀 Key Features of this Fork
+
+- **Minimal Firmware Image (`machine-hw-image`)**: A lightweight Yocto-based Linux distribution containing only system essentials, SSH, Qualcomm BSP drivers, and the `vector-hw-api` device service.
+- **Companion LAN Web UI (`tools/vector-web-ui`)**: A Next.js-powered control dashboard to monitor hardware status, cameras, sensors, and drive the robot remotely from any browser.
+- **Embedded Python SDK & CLI (`tools/vector-robot-sdk`)**:
+  - `vector_robot.py`: Dependency-free Python client for the HTTP/WebSocket hardware API.
+  - `vectorctl.py`: Interactive CLI to command motors, inspect sensors, display images, and capture camera snapshots.
+  - `vector_mcp.py`: Model Context Protocol (MCP) server allowing LLMs to interact directly with the robot.
+
+---
+
+## 📂 Repository Layout & Documentation
+
+- [AGENTS.md](file:///Users/velizard/Projects/wire-os/AGENTS.md): Workspace coordination rules and setup protocols.
+- [docs/project-workspace.md](file:///Users/velizard/Projects/wire-os/docs/project-workspace.md): Technical overview of the workspace and file paths.
+- [docs/vector-hardware-status.md](file:///Users/velizard/Projects/wire-os/docs/vector-hardware-status.md): Feature-by-feature hardware validation matrix and roadmap.
+- [docs/vector-hw-image.md](file:///Users/velizard/Projects/wire-os/docs/vector-hw-image.md): How to build the custom minimal Yocto image using Docker on macOS/Linux.
+- [docs/vector-web-ui.md](file:///Users/velizard/Projects/wire-os/docs/vector-web-ui.md): Development guide for the Next.js companion control site.
+
+---
+
+## 🛠 Quick Start
+
+### Running the Control Web UI
+```sh
+cd tools/vector-web-ui
+VECTOR_ROBOT_IP=<robot-ip> bun run dev
+```
+Open [http://localhost:3000](http://localhost:3000) to access the premium control center.
+
+### Controlling the Robot via CLI
+```sh
+cd tools/vector-robot-sdk
+python3 vectorctl.py --ip <robot-ip> status
+python3 vectorctl.py --ip <robot-ip> drive --speed 100 --duration 2.0
+```
+
+---
+
+## 🏗 Original WireOS Documentation
+
 
 ## Vector
 
