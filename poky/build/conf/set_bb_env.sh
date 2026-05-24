@@ -214,12 +214,22 @@ function build-devcloudless() {
   build-8009-robot-perf-cloudless-image ${@}
 }
 
+function build-hwdev() {
+  unset_bb_env
+  export MACHINE=apq8009-robot
+  export DISTRO=msm-perf
+  export VARIANT=perf
+  export PRODUCT=robot
+  export DEV="1"
+  cdbitbake ${@} machine-hw-image
+}
+
 function build-prod() {
   build-victor-robot-user-image ${@}
 }
 
 # cleared every time
-cleanList=(victor wired vic-cloud core-image-anki-initramfs rampost anki-version machine-robot-image system-conf extra-conf vic-engine vic-robot update-os update-engine wireutils wlan-opensource wcnss mm-camera initscript-anki rebooter adreno adsprpc vic-anim vic-switchboard vic-gateway-cert base-files libpvictor fake-hwclock purplpkg)
+cleanList=(victor wired vic-cloud core-image-anki-initramfs rampost anki-version machine-robot-image machine-hw-image vector-hw system-conf extra-conf vic-engine vic-robot update-os update-engine wireutils wlan-opensource wcnss mm-camera initscript-anki rebooter adreno adsprpc vic-anim vic-switchboard vic-gateway-cert base-files libpvictor fake-hwclock purplpkg)
 
 function clean-oskr() {
   unset_bb_env
@@ -251,6 +261,17 @@ function clean-devcloudless() {
   export CLOUDLESS=1
   wire-clean
   cdbitbake ${@} -c cleanall ${cleanList[@]} vic-cloudless
+}
+
+function clean-hwdev() {
+  unset_bb_env
+  export MACHINE=apq8009-robot
+  export DISTRO=msm-perf
+  export VARIANT=perf
+  export PRODUCT=robot
+  export DEV="1"
+  wire-clean
+  cdbitbake ${@} -c cleanall vector-hw machine-hw-image
 }
 
 function clean-prod() {
@@ -304,6 +325,7 @@ list-build-commands()
     echo "  build-dev"
     echo "  build-oskr"
     echo "  build-devcloudless"
+    echo "  build-hwdev"
     echo "  build-prod"
     echo
     echo "Use 'list-build-commands' to see this list again."

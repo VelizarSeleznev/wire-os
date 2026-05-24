@@ -1,0 +1,79 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+API="${VECTOR_HW_API:-http://127.0.0.1:8080}"
+
+usage() {
+  echo "usage: vector-hw-cli status|sensors|events|motors L R LIFT HEAD [TTL_MS]|brightness LEVEL|display-init|display-frame RGB565_FILE|audio-play WAV_FILE|audio-stop|audio-volume LEVEL|backpack R G B [R G B ...]|apps"
+}
+
+cmd="${1:-}"
+shift || true
+
+case "$cmd" in
+  status)
+    curl -fsS "$API/v1/status"
+    ;;
+  sensors)
+    curl -fsS "$API/v1/sensors"
+    ;;
+  events)
+    curl -fsS "$API/v1/events"
+    ;;
+  motors)
+    if [ "$#" -lt 4 ]; then usage; exit 2; fi
+    ttl="${5:-250}"
+    curl -fsS -X POST "$API/v1/motors" \
+      -H 'Content-Type: application/json' \
+      -d "{\"left\":$1,\"right\":$2,\"lift\":$3,\"head\":$4,\"ttl_ms\":$ttl}"
+    ;;
+  brightness)
+    if [ "$#" -ne 1 ]; then usage; exit 2; fi
+    curl -fsS -X POST "$API/v1/display/brightness" \
+      -H 'Content-Type: application/json' \
+      -d "{\"level\":$1}"
+    ;;
+  display-init)
+    curl -fsS -X POST "$API/v1/display/init"
+    ;;
+  display-frame)
+    if [ "$#" -ne 1 ]; then usage; exit 2; fi
+    curl -fsS -X POST "$API/v1/display/frame" \
+      -H 'Content-Type: application/octet-stream' \
+      --data-binary "@$1"
+    ;;
+  audio-play)
+    if [ "$#" -ne 1 ]; then usage; exit 2; fi
+    curl -fsS -X POST "$API/v1/audio/play" \
+      -H 'Content-Type: audio/wav' \
+      --data-binary "@$1"
+    ;;
+  audio-stop)
+    curl -fsS -X POST "$API/v1/audio/stop"
+    ;;
+  audio-volume)
+    if [ "$#" -ne 1 ]; then usage; exit 2; fi
+    curl -fsS -X POST "$API/v1/audio/volume" \
+      -H 'Content-Type: application/json' \
+      -d "{\"level\":$1}"
+    ;;
+  backpack)
+    if [ "$#" -lt 3 ]; then usage; exit 2; fi
+    vals=""
+    while [ "$#" -ge 3 ]; do
+      vals="${vals}{\"r\":$1,\"g\":$2,\"b\":$3},"
+      shift 3
+    done
+    vals="${vals%,}"
+    curl -fsS -X POST "$API/v1/leds/backpack" \
+      -H 'Content-Type: application/json' \
+      -d "{\"leds\":[${vals}]}"
+    ;;
+  apps)
+    curl -fsS "$API/v1/apps"
+    ;;
+  *)
+    usage
+    exit 2
+    ;;
+esac

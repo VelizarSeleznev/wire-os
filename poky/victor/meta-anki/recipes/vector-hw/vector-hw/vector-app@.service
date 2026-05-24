@@ -1,0 +1,20 @@
+[Unit]
+Description=Vector local app %i
+After=vector-hw-api.service
+Requires=vector-hw-api.service
+
+[Service]
+Type=simple
+User=vectorapp
+Group=vectorapp
+WorkingDirectory=/data/vector-apps/%i
+Environment=VECTOR_HW_API=http://127.0.0.1:8080
+EnvironmentFile=-/data/vector-apps/%i/env
+ExecStart=/data/vector-apps/%i/run
+Restart=on-failure
+RestartSec=2
+NoNewPrivileges=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=vector-hw.target

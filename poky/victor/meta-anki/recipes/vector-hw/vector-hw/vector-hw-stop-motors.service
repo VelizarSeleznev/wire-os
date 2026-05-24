@@ -1,0 +1,6 @@
+[Unit]
+Description=Best-effort Vector motor stop
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/vector-hw-api --stop-motors

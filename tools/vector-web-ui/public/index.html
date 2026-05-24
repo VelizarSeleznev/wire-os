@@ -1,0 +1,316 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Vector Robot Console</title>
+  <meta name="description" content="Real-time control and telemetry dashboard for Anki Vector robot." />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="index.css" />
+</head>
+<body>
+
+<!-- ══ HEADER ══ -->
+<header class="top-bar">
+  <div class="top-bar-left">
+    <div class="logo">
+      <svg width="26" height="26" viewBox="0 0 28 28" fill="none">
+        <rect width="28" height="28" rx="6" fill="url(#lg)"/>
+        <circle cx="14" cy="14" r="5" fill="none" stroke="#0ef" stroke-width="2"/>
+        <circle cx="14" cy="14" r="2" fill="#0ef"/>
+        <defs><linearGradient id="lg" x1="0" y1="0" x2="28" y2="28">
+          <stop offset="0%" stop-color="#0b1326"/>
+          <stop offset="100%" stop-color="#0d1f40"/>
+        </linearGradient></defs>
+      </svg>
+      <span>VECTOR <em>CONSOLE</em></span>
+    </div>
+    <div class="conn-status">
+      <span class="dot" id="dot"></span>
+      <span id="conn-label">DISCONNECTED</span>
+    </div>
+    <div class="telem-wrap">
+      <span class="beat-dot dead" id="telemetry-beat"></span>
+      <span class="telem-label">TELEMETRY</span>
+    </div>
+  </div>
+  <div class="top-bar-right">
+    <input type="text" id="robot-ip" value="192.168.1.89" placeholder="Robot IP" spellcheck="false" />
+    <button id="btn-connect" class="btn primary" onclick="toggleConnect()">CONNECT</button>
+    <div class="battery-box" id="battery-box">
+      <svg width="36" height="18" viewBox="0 0 36 18">
+        <rect x="1" y="1" width="30" height="16" rx="3" stroke="currentColor" stroke-width="1.5" fill="none"/>
+        <rect x="31" y="6" width="4" height="6" rx="1" fill="currentColor" opacity="0.4"/>
+        <rect id="bat-fill" x="3" y="3" width="0" height="12" rx="2" fill="#39ff6e"/>
+      </svg>
+      <span id="bat-v">-- V</span>
+      <span id="bat-t">--°C</span>
+    </div>
+  </div>
+</header>
+
+<!-- ══ MAIN ══ -->
+<main class="main-grid">
+
+  <!-- ── LEFT: Drive ── -->
+  <section class="panel drive-panel">
+    <div class="panel-title">DRIVE</div>
+
+    <div class="joystick-wrap">
+      <div id="joystick-zone">
+        <div id="joystick-ring">
+          <div id="jaxis-h"></div>
+          <div id="jaxis-v"></div>
+          <div id="joystick-knob"></div>
+        </div>
+      </div>
+      <div class="js-readout">
+        <div>L <span class="val" id="vml">0%</span></div>
+        <div class="js-state" id="js-state">STANDBY</div>
+        <div>R <span class="val" id="vmr">0%</span></div>
+      </div>
+    </div>
+
+    <div class="drive-vis-wrap">
+      <div class="panel-title" style="margin-bottom:8px;font-size:9px">DRIVE VECTOR</div>
+      <canvas id="drive-canvas" width="180" height="130"></canvas>
+    </div>
+  </section>
+
+  <!-- ── CENTRE: Tabbed panels ── -->
+  <section class="centre-col">
+
+    <!-- Tab bar -->
+    <div class="tab-bar">
+      <button class="tab-btn active" data-tab="tab-motors" id="tbtn-motors">MOTORS</button>
+      <button class="tab-btn" data-tab="tab-camera" id="tbtn-camera">CAMERA</button>
+      <button class="tab-btn" data-tab="tab-display" id="tbtn-display">DISPLAY</button>
+      <button class="tab-btn" data-tab="tab-audio" id="tbtn-audio">AUDIO</button>
+    </div>
+
+    <!-- ── Tab: MOTORS ── -->
+    <div class="tab-pane active panel" id="tab-motors">
+      <div class="two-col-row">
+        <!-- Left: sliders -->
+        <div class="slider-stack">
+          <div class="slider-group">
+            <div class="slider-label"><span>HEAD</span><span class="val" id="vhead">0%</span></div>
+            <input type="range" id="slider-head" class="vslider" min="-100" max="100" value="0" />
+          </div>
+          <div class="slider-group">
+            <div class="slider-label"><span>LIFT</span><span class="val" id="vlift">0%</span></div>
+            <input type="range" id="slider-lift" class="vslider" min="-100" max="100" value="0" />
+          </div>
+          <div class="slider-group">
+            <div class="slider-label"><span>BACKLIGHT</span><span class="val" id="vbright">128</span></div>
+            <input type="range" id="slider-bright" class="vslider" min="0" max="255" value="128" />
+          </div>
+        </div>
+        <!-- Right: LED picker -->
+        <div class="led-stack">
+          <div class="panel-title" style="font-size:9px">LEDS</div>
+          <div class="led-picker-row">
+            <input type="color" id="led-color" value="#00ffff" />
+            <div class="led-preview" id="led-preview"></div>
+          </div>
+          <div class="presets-sm">
+            <button class="preset" data-r="0"   data-g="240" data-b="255" style="--c:#00f0ff">C</button>
+            <button class="preset" data-r="255" data-g="80"  data-b="0"   style="--c:#ff5000">O</button>
+            <button class="preset" data-r="255" data-g="0"   data-b="60"  style="--c:#ff003c">R</button>
+            <button class="preset" data-r="80"  data-g="255" data-b="80"  style="--c:#50ff50">G</button>
+            <button class="preset" data-r="180" data-g="0"   data-b="255" style="--c:#b400ff">P</button>
+            <button class="preset" data-r="0"   data-g="0"   data-b="0"   style="--c:#333">✕</button>
+          </div>
+          <button class="btn" onclick="sendLeds()" style="margin-top:6px;width:100%;font-size:11px">APPLY</button>
+        </div>
+      </div>
+
+      <!-- Encoder state -->
+      <div class="section-divider">ENCODER STATE</div>
+      <div class="encoder-grid" id="encoder-grid">
+        <div class="enc-row" id="enc-0">
+          <span class="enc-name">L-TRACK</span>
+          <span class="enc-pos val" id="enc-pos-0">--</span>
+          <span class="enc-delta" id="enc-delta-0">Δ--</span>
+          <span class="enc-moving" id="enc-moving-0"></span>
+        </div>
+        <div class="enc-row" id="enc-1">
+          <span class="enc-name">R-TRACK</span>
+          <span class="enc-pos val" id="enc-pos-1">--</span>
+          <span class="enc-delta" id="enc-delta-1">Δ--</span>
+          <span class="enc-moving" id="enc-moving-1"></span>
+        </div>
+        <div class="enc-row" id="enc-2">
+          <span class="enc-name">LIFT</span>
+          <span class="enc-pos val" id="enc-pos-2">--</span>
+          <span class="enc-delta" id="enc-delta-2">Δ--</span>
+          <span class="enc-moving" id="enc-moving-2"></span>
+        </div>
+        <div class="enc-row" id="enc-3">
+          <span class="enc-name">HEAD</span>
+          <span class="enc-pos val" id="enc-pos-3">--</span>
+          <span class="enc-delta" id="enc-delta-3">Δ--</span>
+          <span class="enc-moving" id="enc-moving-3"></span>
+        </div>
+      </div>
+
+      <!-- Position control -->
+      <div class="section-divider">POSITION CONTROL</div>
+      <div class="pos-control-group">
+        <span class="pos-label">LIFT</span>
+        <input type="number" id="goto-lift-ticks" class="pos-input" value="500" min="-50000" max="50000" />
+        <span class="pos-unit">ticks</span>
+        <button class="btn-sm pos-go" id="btn-goto-lift">GO</button>
+        <button class="btn-sm pos-hold" id="btn-hold-lift">HOLD</button>
+      </div>
+      <div class="pos-control-group">
+        <span class="pos-label">HEAD</span>
+        <input type="number" id="goto-head-ticks" class="pos-input" value="500" min="-50000" max="50000" />
+        <span class="pos-unit">ticks</span>
+        <button class="btn-sm pos-go" id="btn-goto-head">GO</button>
+        <button class="btn-sm pos-hold" id="btn-hold-head">HOLD</button>
+      </div>
+      <button class="btn danger" style="width:100%;margin-top:6px;font-size:11px;padding:5px" id="btn-motors-stop">⏹ STOP ALL MOTORS</button>
+    </div>
+
+    <!-- ── Tab: CAMERA ── -->
+    <div class="tab-pane panel" id="tab-camera">
+      <!-- Live image -->
+      <div class="cam-feed-wrap" id="cam-feed-wrap">
+        <div class="cam-offline" id="cam-offline">
+          <div class="cam-scanline"></div>
+          <div class="cam-icon">📷</div>
+          <div class="cam-text">NO FEED</div>
+          <div class="cam-subtext">Start daemon then stream</div>
+        </div>
+        <!-- <img> injected by JS -->
+      </div>
+      <!-- Status row -->
+      <div class="cam-status-row">
+        <div class="stat"><span class="stat-l">DAEMON</span><span class="val" id="vcam-daemon">UNKNOWN</span></div>
+        <div class="stat"><span class="stat-l">STREAM</span><span class="val" id="vcam-stream">IDLE</span></div>
+      </div>
+      <!-- Controls -->
+      <div class="cam-btn-row">
+        <button class="btn primary" id="btn-cam-start">START DAEMON</button>
+        <button class="btn danger"  id="btn-cam-stop">STOP DAEMON</button>
+      </div>
+      <div class="cam-btn-row">
+        <button class="btn" id="btn-cam-stream-on">▶ START STREAM</button>
+        <button class="btn" id="btn-cam-snapshot">📷 SNAPSHOT</button>
+      </div>
+      <div class="stat" style="margin-top:6px">
+        <span class="stat-l">FPS</span>
+        <span class="val" id="vcam-fps">--</span>
+      </div>
+    </div>
+
+    <!-- ── Tab: DISPLAY ── -->
+    <div class="tab-pane panel" id="tab-display">
+      <div class="panel-title">FACE DISPLAY</div>
+      <canvas id="face-preview" width="184" height="96"></canvas>
+      <div class="media-row">
+        <input type="file" id="display-file" accept="image/*,video/*" />
+        <button class="btn" id="btn-display-init">INIT</button>
+      </div>
+      <div class="media-row">
+        <button class="btn primary" id="btn-display-send">SEND FRAME</button>
+        <button class="btn" id="btn-video-toggle">PLAY VIDEO</button>
+      </div>
+      <video id="video-source" muted playsinline style="display:none"></video>
+      <div class="stat"><span class="stat-l">FRAME</span><span class="val" id="vdisplay">READY</span></div>
+    </div>
+
+    <!-- ── Tab: AUDIO ── -->
+    <div class="tab-pane panel" id="tab-audio">
+      <div class="panel-title">AUDIO</div>
+      <input type="file" id="audio-file" accept="audio/*,.wav,.mp3" style="margin-bottom:8px"/>
+      <div class="slider-group compact">
+        <div class="slider-label"><span>VOLUME</span><span class="val" id="vvolume">100%</span></div>
+        <input type="range" id="slider-volume" class="vslider" min="0" max="100" value="100" />
+      </div>
+      <div class="media-row">
+        <button class="btn primary" id="btn-audio-play">▶ PLAY</button>
+        <button class="btn danger"  id="btn-audio-stop">■ STOP</button>
+      </div>
+      <div class="stat" style="margin-bottom:12px"><span class="stat-l">PLAYER</span><span class="val" id="vaudio">IDLE</span></div>
+
+      <div class="section-divider">MICROPHONE</div>
+      <div class="media-row">
+        <button class="btn primary" id="btn-mic-toggle">START LISTENING</button>
+        <button class="btn danger"  id="btn-mic-record" disabled>RECORD</button>
+      </div>
+      <div class="stat"><span class="stat-l">MIC STREAM</span><span class="val" id="vmic-status">OFFLINE</span></div>
+
+      <div class="radar-container" id="mic-radar-container" style="margin-top:12px">
+        <div class="radar-mic mic-fl" id="mic-node-0"><span class="mic-name">FL</span></div>
+        <div class="radar-mic mic-fr" id="mic-node-1"><span class="mic-name">FR</span></div>
+        <div class="radar-mic mic-br" id="mic-node-2"><span class="mic-name">BR</span></div>
+        <div class="radar-mic mic-bl" id="mic-node-3"><span class="mic-name">BL</span></div>
+        <div class="radar-center-core">
+          <div class="beam-arrow" id="beam-arrow"></div>
+          <div class="radar-pulse"></div>
+        </div>
+      </div>
+    </div>
+
+  </section>
+
+  <!-- ── RIGHT: Sensors ── -->
+  <section class="panel sensors-panel">
+    <div class="panel-title">SENSORS</div>
+
+    <div class="section-divider">CLIFF</div>
+    <div class="cliff-grid">
+      <div class="cliff-sensor" id="cfl"><span class="cs-label">FL</span><span class="val" id="vfl">--</span></div>
+      <div class="cliff-mid"></div>
+      <div class="cliff-sensor" id="cfr"><span class="cs-label">FR</span><span class="val" id="vfr">--</span></div>
+      <div class="cliff-sensor" id="cbl"><span class="cs-label">BL</span><span class="val" id="vbl">--</span></div>
+      <div class="cliff-mid"></div>
+      <div class="cliff-sensor" id="cbr"><span class="cs-label">BR</span><span class="val" id="vbr">--</span></div>
+    </div>
+
+    <div class="section-divider">TOUCH</div>
+    <div class="stat"><span class="stat-l">TOUCH 0</span><span class="val" id="vt0">--</span></div>
+    <div class="stat"><span class="stat-l">TOUCH 1</span><span class="faulty-badge">N/A</span></div>
+
+    <div class="section-divider">PROXIMITY (TOF)</div>
+    <div class="stat"><span class="stat-l">DISTANCE</span><span class="val" id="vprox-dist">--</span></div>
+    <div class="stat"><span class="stat-l">STATUS</span><span class="val" id="vprox-status">--</span></div>
+
+    <div class="section-divider">IMU</div>
+    <div class="imu-grid">
+      <div class="imu-sublabel">ACCEL (g)</div>
+      <div class="imu-readout">
+        <span>X <span class="val" id="vax">0.00</span></span>
+        <span>Y <span class="val" id="vay">0.00</span></span>
+        <span>Z <span class="val" id="vaz">0.00</span></span>
+      </div>
+      <div class="imu-sublabel" style="margin-top:4px">GYRO (°/s)</div>
+      <div class="imu-readout">
+        <span>X <span class="val" id="vgx">0.00</span></span>
+        <span>Y <span class="val" id="vgy">0.00</span></span>
+        <span>Z <span class="val" id="vgz">0.00</span></span>
+      </div>
+    </div>
+
+    <div class="section-divider">SPINE MCU</div>
+    <div class="stat"><span class="stat-l">FRAME #</span><span class="val" id="vfc">--</span></div>
+  </section>
+
+</main>
+
+<!-- ── LOG BAR ── -->
+<div class="log-bar">
+  <div class="log-header">
+    <span class="panel-title" style="margin:0">LOG</span>
+    <button class="btn-sm" onclick="document.getElementById('log').innerHTML=''">CLEAR</button>
+  </div>
+  <div id="log"></div>
+</div>
+
+<script src="app.js"></script>
+</body>
+</html>

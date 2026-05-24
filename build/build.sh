@@ -14,8 +14,8 @@ CURRENT_CONTAINER_NAME="vic-yocto-builder-7"
 
 function usage() {
     echo "$1"
-    echo "Usage: ./build/build.sh -bt <dev/oskr/devcloudless> -s -op <OTA-pw> -bp <boot-passwd> -v <build-increment> -ui <ui-option>"
-    echo "Usage (no signing): ./build/build.sh -bt <dev/oskr/devcloudless> -bp <boot-passwd> -v <build-increment> -ui <ui-option>"
+    echo "Usage: ./build/build.sh -bt <dev/oskr/devcloudless/hwdev> -s -op <OTA-pw> -bp <boot-passwd> -v <build-increment> -ui <ui-option>"
+    echo "Usage (no signing): ./build/build.sh -bt <dev/oskr/devcloudless/hwdev> -bp <boot-passwd> -v <build-increment> -ui <ui-option>"
     echo "Valid UI options are: knotty, ncurses, taskexp_ncurses, or teamcity. Default is knotty."
     exit 1
 }
@@ -61,7 +61,7 @@ function check_sign_ota() {
 
 function check_submodules() {
 	BAD_SUBMODULE=0
-	if [[ ! -d anki/victor/engine ]]; then
+	if [[ "${BOT_TYPE}" != "hwdev" && ! -d anki/victor/engine ]]; then
 		errorMsg "The anki/victor submodule doesn't exist."
 		BAD_SUBMODULE=1
 	fi
@@ -73,11 +73,11 @@ function check_submodules() {
 		errorMsg "The poky/meta-openembedded submodule doesn't exist."
 		BAD_SUBMODULE=1
 	fi
-	if [[ ! -d external/purplpkg/bash ]]; then
+	if [[ "${BOT_TYPE}" != "hwdev" && ! -d external/purplpkg/bash ]]; then
 		errorMsg "The external/purplpkg submodule doesn't exist."
 		BAD_SUBMODULE=1
 	fi
-	if [[ ! -d anki/wired/webroot ]]; then
+	if [[ "${BOT_TYPE}" != "hwdev" && ! -d anki/wired/webroot ]]; then
 		errorMsg "The anki/wired submodule doesn't exist."
 		BAD_SUBMODULE=1
 	fi
@@ -104,6 +104,10 @@ function errorMsg() {
 }
 
 function is_victor_there_and_compatible() {
+	if [[ "${BOT_TYPE}" == "hwdev" ]]; then
+		echo "Skipping victor compatibility check for hwdev image"
+		return
+	fi
 	if [[ ! -d anki/victor/engine ]]; then
 		errorMsg "anki/victor/engine not found. You likely don't have the victor submodule correctly configured."
 		exit 1
@@ -162,8 +166,8 @@ check_submodules
 
 is_victor_there_and_compatible
 
-if [[ "$BOT_TYPE" != "oskr" && "$BOT_TYPE" != "dev" && "$BOT_TYPE" != "prod" && "$BOT_TYPE" != "devcloudless" ]]; then
-    usage "BOT_TYPE (-bt) should be 'oskr' or 'dev', got: $BOT_TYPE"
+if [[ "$BOT_TYPE" != "oskr" && "$BOT_TYPE" != "dev" && "$BOT_TYPE" != "prod" && "$BOT_TYPE" != "devcloudless" && "$BOT_TYPE" != "hwdev" ]]; then
+    usage "BOT_TYPE (-bt) should be 'oskr', 'dev', 'prod', 'devcloudless', or 'hwdev', got: $BOT_TYPE"
 fi
 
 if [[ "$DO_SIGN" == 1 && "$OTA_SIGNING_KEY_PASSWORD" == "" ]]; then
@@ -222,6 +226,8 @@ export BOOT_IMAGE_SIGNING_PASSWORD="${BOOT_PASSWORD}"
 
 ANKIDEV=1
 
+OTA_IMAGE_RECIPE="machine-robot-image"
+
 if [[ $BOT_TYPE == "oskr" ]]; then
     export BOOT_IMAGE_SIGNING_PASSWORD="${BOOT_PASSWORD}"
 	BOOT_MAKE_COMMAND="make oskrsign"
@@ -231,6 +237,9 @@ elif [[ $BOT_TYPE == "prod" ]]; then
 	ANKIDEV=0
 elif [[ $BOT_TYPE == "devcloudless" ]]; then
     BOOT_MAKE_COMMAND="make devsign"
+elif [[ $BOT_TYPE == "hwdev" ]]; then
+	BOOT_MAKE_COMMAND="make devsign"
+	OTA_IMAGE_RECIPE="machine-hw-image"
 else
 	BOOT_MAKE_COMMAND="make devsign"
 fi
@@ -242,7 +251,7 @@ fi
 
 if [[ "${NO_DOCKER}" != "1" ]]; then
     if [[ -z $(docker images -q ${CURRENT_CONTAINER_NAME}) ]]; then
-        docker build --build-arg DIR_PATH="${DIRPATH}" --build-arg USER_NAME=$USER --build-arg UID=$(id -u $USER) --build-arg GID=$(id -u $USER) -t ${CURRENT_CONTAINER_NAME} build/
+        docker build --build-arg DIR_PATH="${DIRPATH}" --build-arg USER_NAME=$USER --build-arg UID=$(id -u $USER) --build-arg GID=$(id -g $USER) -t ${CURRENT_CONTAINER_NAME} build/
     else
         echo "Reusing ${CURRENT_CONTAINER_NAME}"
     fi
@@ -270,8 +279,8 @@ FINAL_BUILD_INVOCATION="cd $(pwd)/poky && \
     export DO_SIGN=${DO_SIGN} && \
     export OTA_MANIFEST_SIGNING_KEY=${OTA_SIGNING_KEY_PASSWORD} && \
     export BOOT_IMAGE_SIGNING_PASSWORD=${BOOT_PASSWORD} && \
-    ${BOOT_MAKE_COMMAND} && \
-    ANKIDEV=${ANKIDEV} make"
+    OS_VERSION_FILE=../poky/build/tmp-glibc/work/apq8009_robot-oe-linux-gnueabi/${OTA_IMAGE_RECIPE}/1.0/rootfs/etc/os-version ${BOOT_MAKE_COMMAND} && \
+    OS_VERSION_FILE=../poky/build/tmp-glibc/work/apq8009_robot-oe-linux-gnueabi/${OTA_IMAGE_RECIPE}/1.0/rootfs/etc/os-version ANKIDEV=${ANKIDEV} make"
 
 if [[ ${NO_DOCKER} == "1" ]]; then
     bash -c "${FINAL_BUILD_INVOCATION}"

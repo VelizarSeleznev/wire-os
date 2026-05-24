@@ -24,7 +24,12 @@ RUN echo "en_US.UTF-8 UTF-8" > /etc/locale.gen && locale-gen en_US.UTF-8
 ENV LANG=en_US.UTF-8
 ENV LANGUAGE=en_US:en
 ENV LC_ALL=en_US.UTF-8
-RUN usermod -u ${UID} ${USER_NAME} && groupmod -g ${GID} ${USER_NAME}
+RUN usermod -u ${UID} ${USER_NAME} && \
+    if getent group ${GID} >/dev/null; then \
+        usermod -g ${GID} ${USER_NAME}; \
+    else \
+        groupmod -g ${GID} ${USER_NAME}; \
+    fi
 
 RUN set -e; \
     arch="$(dpkg --print-architecture)"; \

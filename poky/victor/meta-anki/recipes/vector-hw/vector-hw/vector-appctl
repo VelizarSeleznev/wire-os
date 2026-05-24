@@ -1,0 +1,147 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+APP_ROOT=/data/vector-apps
+UNIT_ROOT=/run/systemd/system
+
+usage() {
+  echo "usage: vector-appctl list|install BUNDLE.tar.gz|start ID|stop ID|delete ID|status ID|boot"
+}
+
+valid_id() {
+  case "$1" in
+    ""|*[^A-Za-z0-9_.-]*|.*|*-|*..*) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
+ensure_root() {
+  mkdir -p "$APP_ROOT"
+}
+
+manifest_value() {
+  local file="$1"
+  local expr="$2"
+  jq -er "$expr" "$file"
+}
+
+apply_unit_override() {
+  local id="$1"
+  local manifest="$APP_ROOT/$id/manifest.json"
+  local restart
+  [ -f "$manifest" ] || { echo "missing app manifest: $id" >&2; return 1; }
+  restart="$(jq -er '.restart // "on-failure"' "$manifest")"
+  case "$restart" in
+    no|always|on-success|on-failure|on-abnormal|on-watchdog|on-abort) ;;
+    *) echo "invalid restart policy: $restart" >&2; return 1 ;;
+  esac
+  mkdir -p "$UNIT_ROOT/vector-app@$id.service.d"
+  cat > "$UNIT_ROOT/vector-app@$id.service.d/override.conf" <<EOF
+[Service]
+Restart=$restart
+EOF
+}
+
+cmd="${1:-}"
+shift || true
+
+case "$cmd" in
+  list)
+    ensure_root
+    printf '['
+    first=1
+    for manifest in "$APP_ROOT"/*/manifest.json; do
+      [ -e "$manifest" ] || continue
+      [ "$first" -eq 0 ] && printf ','
+      first=0
+      jq -c '{id,name,version,autostart}' "$manifest"
+    done
+    printf ']\n'
+    ;;
+  install)
+    bundle="${1:-}"
+    if [ -z "$bundle" ] || [ ! -f "$bundle" ]; then usage; exit 2; fi
+    ensure_root
+    tmp="$(mktemp -d /data/vector-app-install.XXXXXX)"
+    trap 'rm -rf "$tmp"' EXIT
+    tar -xzf "$bundle" -C "$tmp"
+    manifest="$tmp/manifest.json"
+    if [ ! -f "$manifest" ]; then
+      manifest="$(find "$tmp" -maxdepth 2 -name manifest.json | head -n 1)"
+    fi
+    if [ -z "$manifest" ] || [ ! -f "$manifest" ]; then
+      echo "missing manifest.json" >&2
+      exit 1
+    fi
+    id="$(manifest_value "$manifest" '.id')"
+    valid_id "$id" || { echo "invalid id: $id" >&2; exit 1; }
+    command="$(manifest_value "$manifest" '.command')"
+    appdir="$APP_ROOT/$id"
+    systemctl stop "vector-app@$id.service" >/dev/null 2>&1 || true
+    rm -rf "$appdir"
+    mkdir -p "$appdir"
+    srcdir="$(dirname "$manifest")"
+    cp -a "$srcdir"/. "$appdir"/
+    cat > "$appdir/run" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+cd "$appdir"
+exec $command
+EOF
+    chmod 0755 "$appdir/run"
+    jq -r '.env // {} | to_entries[] | "\(.key)=\(.value)"' "$appdir/manifest.json" > "$appdir/env"
+    apply_unit_override "$id"
+    chown -R vectorapp:vectorapp "$appdir" || true
+    systemctl daemon-reload
+    if jq -e '.autostart == true' "$appdir/manifest.json" >/dev/null; then
+      systemctl restart "vector-app@$id.service"
+    fi
+    echo "{\"installed\":\"$id\"}"
+    ;;
+  start)
+    id="${1:-}"
+    valid_id "$id" || { usage; exit 2; }
+    apply_unit_override "$id"
+    systemctl daemon-reload
+    systemctl start "vector-app@$id.service"
+    echo "{\"started\":\"$id\"}"
+    ;;
+  stop)
+    id="${1:-}"
+    valid_id "$id" || { usage; exit 2; }
+    systemctl stop "vector-app@$id.service"
+    echo "{\"stopped\":\"$id\"}"
+    ;;
+  delete)
+    id="${1:-}"
+    valid_id "$id" || { usage; exit 2; }
+    systemctl stop "vector-app@$id.service" >/dev/null 2>&1 || true
+    rm -rf "$UNIT_ROOT/vector-app@$id.service.d"
+    rm -rf "$APP_ROOT/$id"
+    systemctl daemon-reload
+    echo "{\"deleted\":\"$id\"}"
+    ;;
+  status)
+    id="${1:-}"
+    valid_id "$id" || { usage; exit 2; }
+    systemctl --no-pager --plain status "vector-app@$id.service"
+    ;;
+  boot)
+    ensure_root
+    for manifest in "$APP_ROOT"/*/manifest.json; do
+      [ -e "$manifest" ] || continue
+      id="$(manifest_value "$manifest" '.id')"
+      valid_id "$id" || continue
+      apply_unit_override "$id"
+      systemctl daemon-reload
+      if jq -e '.autostart == true' "$manifest" >/dev/null; then
+        systemctl start "vector-app@$id.service"
+      fi
+    done
+    echo '{"boot":true}'
+    ;;
+  *)
+    usage
+    exit 2
+    ;;
+esac

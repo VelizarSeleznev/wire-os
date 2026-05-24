@@ -1,0 +1,12 @@
+{
+  "name": "vector-web-ui",
+  "version": "1.0.0",
+  "description": "Visual dashboard and proxy console for Anki Vector minimal OS",
+  "main": "server.js",
+  "type": "module",
+  "scripts": {
+    "dev": "bun run server.js",
+    "start": "bun run server.js",
+    "check": "bun build server.js --target=bun --outfile=/tmp/vector-web-ui-check.js && bun build public/app.js --target=browser --outfile=/tmp/vector-web-ui-app-check.js"
+  }
+}

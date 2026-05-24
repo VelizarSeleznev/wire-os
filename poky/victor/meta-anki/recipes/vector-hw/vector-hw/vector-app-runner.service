@@ -1,0 +1,12 @@
+[Unit]
+Description=Start Vector local apps marked autostart
+After=mount-data.service vector-hw-api.service
+Requires=vector-hw-api.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/vector-appctl boot
+RemainAfterExit=yes
+
+[Install]
+WantedBy=vector-hw.target

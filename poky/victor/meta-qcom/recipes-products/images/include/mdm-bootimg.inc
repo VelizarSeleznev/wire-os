@@ -13,7 +13,7 @@ DEPENDS += " \
              mtd-utils-native \
 "
 
-RDEPENDS += " \
+RDEPENDS:${PN} += " \
              pkgconfig-native \
              gtk-doc-native \
              gettext-native \
