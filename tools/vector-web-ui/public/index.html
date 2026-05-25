@@ -88,6 +88,7 @@
       <button class="tab-btn" data-tab="tab-camera" id="tbtn-camera">CAMERA</button>
       <button class="tab-btn" data-tab="tab-display" id="tbtn-display">DISPLAY</button>
       <button class="tab-btn" data-tab="tab-audio" id="tbtn-audio">AUDIO</button>
+      <button class="tab-btn" data-tab="tab-videos" id="tbtn-videos">VIDEOS</button>
     </div>
 
     <!-- ── Tab: MOTORS ── -->
@@ -253,6 +254,44 @@
           <div class="beam-arrow" id="beam-arrow"></div>
           <div class="radar-pulse"></div>
         </div>
+      </div>
+    </div>
+
+    <!-- ── Tab: VIDEOS ── -->
+    <div class="tab-pane panel" id="tab-videos">
+      <div class="panel-title">VIDEO MANAGER & PONG</div>
+      
+      <!-- Video List on Robot -->
+      <div class="section-divider">VIDEOS ON ROBOT</div>
+      <div id="vvid-list-container" class="encoder-grid" style="margin-bottom:12px; max-height: 120px; overflow-y: auto;">
+        <div style="color:var(--cyan);font-size:11px;padding:6px;text-align:center">No videos found.</div>
+      </div>
+      
+      <div class="media-row" style="margin-bottom: 12px;">
+        <button class="btn" id="btn-vvid-refresh">REFRESH LIST</button>
+        <button class="btn danger" id="btn-vvid-stop">⏹ STOP VIDEO</button>
+      </div>
+
+      <!-- Convert & Upload Video -->
+      <div class="section-divider">CONVERT & UPLOAD VIDEO (.MP4)</div>
+      <div class="media-row">
+        <input type="file" id="vvid-file-input" accept="video/mp4,video/quicktime,video/x-msvideo" style="width:100%" />
+      </div>
+      <div class="media-row">
+        <button class="btn primary" id="btn-vvid-upload" disabled>CONVERT & UPLOAD</button>
+      </div>
+      <div class="stat"><span class="stat-l">STATUS</span><span class="val" id="vvid-upload-status">READY</span></div>
+
+      <!-- Pong Game Controls -->
+      <div class="section-divider">RETRO PONG (TRACK-CONTROLLED)</div>
+      <div class="media-row">
+        <button class="btn primary" id="btn-pong-start">🕹 START PONG</button>
+        <button class="btn danger" id="btn-pong-stop">■ STOP PONG</button>
+      </div>
+      <div class="stat"><span class="stat-l">PONG STATUS</span><span class="val" id="vpong-status">INACTIVE</span></div>
+      <div class="cam-status-row" style="margin-top:6px">
+        <div class="stat"><span class="stat-l">LEFT SCORE</span><span class="val" id="vpong-score-left">0</span></div>
+        <div class="stat"><span class="stat-l">RIGHT SCORE</span><span class="val" id="vpong-score-right">0</span></div>
       </div>
     </div>
 

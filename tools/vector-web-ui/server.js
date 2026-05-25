@@ -1,6 +1,9 @@
 import { join } from "path";
 import dgram from "dgram";
 import { networkInterfaces } from "os";
+import net from "net";
+
+let robotStreamSocket = null;
 
 const PORT = Number(Bun.env.PORT || 3000);
 const PUBLIC_DIR = join(import.meta.dir, "public");
@@ -295,10 +298,38 @@ const server = Bun.serve({
     },
 
     message(ws, raw) {
+      if (typeof raw !== "string") {
+        // High-speed binary frame stream pass-through
+        if (robotStreamSocket && !robotStreamSocket.destroyed) {
+          robotStreamSocket.write(raw);
+        }
+        return;
+      }
+
       let msg;
       try { msg = JSON.parse(raw); } catch { return; }
 
       switch (msg.type) {
+        case "display_stream_start":
+          if (robotStreamSocket) {
+            robotStreamSocket.destroy();
+            robotStreamSocket = null;
+          }
+          robotStreamSocket = net.connect({ host: robotIp, port: robotPort }, () => {
+            robotStreamSocket.write("POST /v1/display/stream HTTP/1.1\r\n" +
+                                    "Host: " + robotIp + ":" + robotPort + "\r\n" +
+                                    "Content-Type: application/octet-stream\r\n" +
+                                    "Connection: keep-alive\r\n\r\n");
+          });
+          break;
+
+        case "display_stream_stop":
+          if (robotStreamSocket) {
+            robotStreamSocket.destroy();
+            robotStreamSocket = null;
+          }
+          break;
+
         case "motors":
           target.left  = clamp(msg.left  ?? 0);
           target.right = clamp(msg.right ?? 0);
@@ -370,6 +401,10 @@ const server = Bun.serve({
         target.left = target.right = target.lift = target.head = 0;
         stopUdpAudio();
         robotPost("/v1/audio/stop", {});
+        if (robotStreamSocket) {
+          robotStreamSocket.destroy();
+          robotStreamSocket = null;
+        }
       }
       console.log(`[WS] -client  total=${wsClients.size}`);
     },

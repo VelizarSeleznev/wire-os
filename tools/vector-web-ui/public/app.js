@@ -68,6 +68,18 @@ const D = {
   btnMicRecord: $("btn-mic-record"),
   vmicStatus: $("vmic-status"),
   beamArrow: $("beam-arrow"),
+  // videos & pong
+  vvidListContainer: $("vvid-list-container"),
+  btnVvidRefresh: $("btn-vvid-refresh"),
+  btnVvidStop: $("btn-vvid-stop"),
+  vvidFileInput: $("vvid-file-input"),
+  btnVvidUpload: $("btn-vvid-upload"),
+  vvidUploadStatus: $("vvid-upload-status"),
+  btnPongStart: $("btn-pong-start"),
+  btnPongStop: $("btn-pong-stop"),
+  vpongStatus: $("vpong-status"),
+  vpongScoreLeft: $("vpong-score-left"),
+  vpongScoreRight: $("vpong-score-right"),
   micNodes: [
     $("mic-node-0"),
     $("mic-node-1"),
@@ -760,6 +772,10 @@ function stopVideoStream({ cancelAudio = false, releaseUrl = false } = {}) {
   videoTimer = null;
   D.videoToggle.textContent = "PLAY VIDEO";
   if (!D.videoSource.paused) D.videoSource.pause();
+  
+  // Stop high-speed display stream on WebSocket
+  sendWs({ type: "display_stream_stop" });
+  
   if (cancelAudio) {
     audioPlayToken++;
     robotFetch("/audio/stop", { method: "POST" }).catch(() => {});
@@ -789,10 +805,17 @@ D.videoToggle.addEventListener("click", async () => {
   D.videoSource.currentTime = 0;
   await D.videoSource.play();
   D.videoToggle.textContent = "STOP VIDEO";
+  
+  // Start high-speed display stream on WebSocket
+  sendWs({ type: "display_stream_start" });
+  
   videoTimer = setInterval(() => {
     drawVideoToFace();
-    sendDisplayFrame();
-  }, 120);
+    const frame = rgb565FromPreview();
+    if (S.ws && S.ws.readyState === WebSocket.OPEN) {
+      S.ws.send(frame);
+    }
+  }, 33); // 30 FPS
 
   if (preparedAudio) {
     playPreparedAudioChunks(preparedAudio, token).catch(e => {
@@ -1417,6 +1440,292 @@ function initTabs() {
   });
 }
 
+// ── VVID Video Manager & Pong Game ────────────────────────────────────────────────
+function setVvidUploadStatus(text, cls = "") {
+  if (D.vvidUploadStatus) {
+    D.vvidUploadStatus.textContent = text;
+    D.vvidUploadStatus.className = "val " + cls;
+  }
+}
+
+async function fetchVideos() {
+  try {
+    const res = await robotFetch("/videos");
+    if (!res.ok) throw new Error(await res.text());
+    const list = await res.json();
+    
+    D.vvidListContainer.innerHTML = "";
+    if (list.length === 0) {
+      D.vvidListContainer.innerHTML = `<div style="color:var(--cyan);font-size:11px;padding:6px;text-align:center">No videos found on robot.</div>`;
+      return;
+    }
+    
+    list.forEach(name => {
+      const row = document.createElement("div");
+      row.className = "enc-row";
+      row.style.gridTemplateColumns = "1fr auto auto";
+      row.style.gap = "8px";
+      row.style.alignItems = "center";
+      row.style.padding = "4px 8px";
+      
+      row.innerHTML = `
+        <span class="enc-name" style="text-overflow:ellipsis; overflow:hidden; white-space:nowrap; text-align:left;" title="${name}">${name}</span>
+        <button class="btn-sm" style="font-size:9px;padding:2px 8px;background:var(--green);border-color:var(--green)" onclick="playRobotVideo('${name}')">PLAY</button>
+        <button class="btn-sm danger" style="font-size:9px;padding:2px 8px;" onclick="deleteRobotVideo('${name}')">DEL</button>
+      `;
+      D.vvidListContainer.appendChild(row);
+    });
+  } catch (e) {
+    log("ERROR", `Failed to fetch video list: ${e.message}`);
+  }
+}
+
+window.playRobotVideo = async function(name) {
+  try {
+    log("INFO", `Playing robot video: ${name}...`);
+    const res = await robotFetch("/videos/play", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name })
+    });
+    if (!res.ok) throw new Error(await res.text());
+    log("OK", `Video play started.`);
+  } catch (e) {
+    log("ERROR", `Failed to play video: ${e.message}`);
+  }
+};
+
+window.deleteRobotVideo = async function(name) {
+  if (!confirm(`Are you sure you want to delete ${name}?`)) return;
+  try {
+    log("INFO", `Deleting robot video: ${name}...`);
+    const res = await robotFetch(`/videos/${name}`, { method: "DELETE" });
+    if (!res.ok) throw new Error(await res.text());
+    log("OK", `Deleted video: ${name}`);
+    await fetchVideos();
+  } catch (e) {
+    log("ERROR", `Failed to delete video: ${e.message}`);
+  }
+};
+
+async function stopRobotVideo() {
+  try {
+    const res = await robotFetch("/videos/stop", { method: "POST" });
+    if (!res.ok) throw new Error(await res.text());
+    log("INFO", "Stopped video playback on robot.");
+  } catch (e) {
+    log("ERROR", `Failed to stop video: ${e.message}`);
+  }
+}
+
+async function prepareAudioForVvid(file) {
+  const samples = await decodeAudioFileToMono(file).catch(err => {
+    log("WARN", `Audio extraction failed, creating silent track: ${err.message}`);
+    return new Float32Array(AUDIO_SAMPLE_RATE);
+  });
+  return encodeWavPcm16(samples, AUDIO_SAMPLE_RATE);
+}
+
+async function extractVideoFrames(file, fps) {
+  return new Promise((resolve, reject) => {
+    const video = document.createElement("video");
+    video.muted = true;
+    video.playsInline = true;
+    const url = URL.createObjectURL(file);
+    video.src = url;
+    
+    video.onloadedmetadata = async () => {
+      try {
+        const duration = video.duration;
+        const totalFrames = Math.floor(duration * fps);
+        const frames = [];
+        
+        const canvas = document.createElement("canvas");
+        canvas.width = 184;
+        canvas.height = 96;
+        const ctx = canvas.getContext("2d");
+        
+        for (let i = 0; i < totalFrames; i++) {
+          const time = i / fps;
+          video.currentTime = time;
+          
+          await new Promise((res, rej) => {
+            video.onseeked = res;
+            video.onerror = rej;
+            setTimeout(() => rej(new Error("Seek timeout")), 5000);
+          });
+          
+          ctx.fillStyle = "#000";
+          ctx.fillRect(0, 0, 184, 96);
+          const scale = Math.min(184 / video.videoWidth, 96 / video.videoHeight);
+          const w = Math.max(1, Math.round(video.videoWidth * scale));
+          const h = Math.max(1, Math.round(video.videoHeight * scale));
+          ctx.drawImage(video, Math.floor((184 - w) / 2), Math.floor((96 - h) / 2), w, h);
+          
+          const img = ctx.getImageData(0, 0, 184, 96).data;
+          const rgb565 = new Uint8Array(184 * 96 * 2);
+          for (let p = 0, q = 0; p < img.length; p += 4, q += 2) {
+            const r = img[p] >> 3;
+            const g = img[p + 1] >> 2;
+            const b = img[p + 2] >> 3;
+            const v = (r << 11) | (g << 5) | b;
+            rgb565[q] = v & 0xff;
+            rgb565[q + 1] = v >> 8;
+          }
+          frames.push(rgb565);
+          
+          setVvidUploadStatus(`EXTRACTING FRAMES: ${Math.round((i / totalFrames) * 100)}%`);
+        }
+        
+        URL.revokeObjectURL(url);
+        resolve(frames);
+      } catch (err) {
+        URL.revokeObjectURL(url);
+        reject(err);
+      }
+    };
+    
+    video.onerror = (e) => {
+      URL.revokeObjectURL(url);
+      reject(new Error("Failed to load video metadata"));
+    };
+  });
+}
+
+function compileVvid(wavBytes, frames, fps) {
+  const magic = new TextEncoder().encode("VVID");
+  const version = 1;
+  const frameCount = frames.length;
+  const audioBytes = wavBytes.byteLength;
+  const headerSize = 24;
+  const videoOffset = headerSize + audioBytes;
+  
+  const totalSize = videoOffset + frameCount * 184 * 96 * 2;
+  const buffer = new ArrayBuffer(totalSize);
+  const view = new DataView(buffer);
+  
+  for (let i = 0; i < 4; i++) view.setUint8(i, magic[i]);
+  view.setUint32(4, version, true);
+  view.setUint32(8, fps, true);
+  view.setUint32(12, frameCount, true);
+  view.setUint32(16, audioBytes, true);
+  view.setUint32(20, videoOffset, true);
+  
+  const u8Buffer = new Uint8Array(buffer);
+  u8Buffer.set(wavBytes, headerSize);
+  
+  let offset = videoOffset;
+  const frameSize = 184 * 96 * 2;
+  for (let i = 0; i < frameCount; i++) {
+    u8Buffer.set(frames[i], offset);
+    offset += frameSize;
+  }
+  
+  return buffer;
+}
+
+async function convertAndUploadVideo(file) {
+  setVvidUploadStatus("DECODING AUDIO...");
+  log("INFO", "Decoding video audio track...");
+  
+  try {
+    const wavBytes = await prepareAudioForVvid(file);
+    setVvidUploadStatus("EXTRACTING VIDEO FRAMES...");
+    log("INFO", "Extracting video frames at 30 FPS...");
+    
+    const frames = await extractVideoFrames(file, 30);
+    setVvidUploadStatus("COMPILING VVID FILE...");
+    log("INFO", `Compiling VVID container (${frames.length} frames)...`);
+    
+    const vvidBuffer = compileVvid(wavBytes, frames, 30);
+    
+    setVvidUploadStatus("UPLOADING TO ROBOT...");
+    log("INFO", `Uploading VVID to robot (${Math.round(vvidBuffer.byteLength / 1024)} KiB)...`);
+    
+    const baseName = file.name.substring(0, file.name.lastIndexOf('.')) || file.name;
+    const vvidName = baseName.replace(/[^a-zA-Z0-9_-]/g, "_") + ".vvid";
+    
+    const res = await robotFetch(`/videos/upload?name=${vvidName}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/octet-stream" },
+      body: vvidBuffer
+    });
+    
+    if (!res.ok) throw new Error(await res.text());
+    
+    setVvidUploadStatus("UPLOAD SUCCESS", "ok");
+    log("OK", `Video uploaded successfully: ${vvidName}`);
+    await fetchVideos();
+  } catch (e) {
+    setVvidUploadStatus("CONVERSION ERROR", "bad");
+    log("ERROR", `Video conversion failed: ${e.message}`);
+  } finally {
+    D.btnVvidUpload.disabled = false;
+    D.vvidFileInput.disabled = false;
+  }
+}
+
+let pongPollTimer = null;
+
+function setPongStatus(text, cls = "") {
+  if (D.vpongStatus) {
+    D.vpongStatus.textContent = text;
+    D.vpongStatus.className = "val " + cls;
+  }
+}
+
+async function startPongGame() {
+  try {
+    log("INFO", "Starting track-controlled Pong...");
+    const res = await robotFetch("/games/pong/start", { method: "POST" });
+    if (!res.ok) throw new Error(await res.text());
+    
+    setPongStatus("ACTIVE", "ok");
+    log("OK", "Pong started! Rotate Vector's wheels to play.");
+    startPongPolling();
+  } catch (e) {
+    setPongStatus("ERROR", "bad");
+    log("ERROR", `Failed to start Pong: ${e.message}`);
+  }
+}
+
+async function stopPongGame() {
+  try {
+    const res = await robotFetch("/games/pong/stop", { method: "POST" });
+    if (!res.ok) throw new Error(await res.text());
+    
+    setPongStatus("INACTIVE");
+    log("INFO", "Pong game stopped.");
+    stopPongPolling();
+  } catch (e) {
+    log("ERROR", `Failed to stop Pong: ${e.message}`);
+  }
+}
+
+function startPongPolling() {
+  if (pongPollTimer) clearInterval(pongPollTimer);
+  pongPollTimer = setInterval(async () => {
+    try {
+      const res = await robotFetch("/games/pong/status");
+      if (res.ok) {
+        const data = await res.json();
+        if (data.active) {
+          D.vpongScoreLeft.textContent = data.score[0];
+          D.vpongScoreRight.textContent = data.score[1];
+        } else {
+          stopPongPolling();
+          setPongStatus("INACTIVE");
+        }
+      }
+    } catch (_) {}
+  }, 300);
+}
+
+function stopPongPolling() {
+  if (pongPollTimer) clearInterval(pongPollTimer);
+  pongPollTimer = null;
+}
+
 // ── Init ───────────────────────────────────────────────────────────────────
 window.addEventListener("load", () => {
   const saved = localStorage.getItem("vec-ip");
@@ -1451,6 +1760,31 @@ window.addEventListener("load", () => {
     log("INFO", "All motors stopped.");
   });
 
+  // Video and Pong controls
+  if (D.btnVvidRefresh) D.btnVvidRefresh.addEventListener("click", fetchVideos);
+  if (D.btnVvidStop) D.btnVvidStop.addEventListener("click", stopRobotVideo);
+  if (D.vvidFileInput) {
+    D.vvidFileInput.addEventListener("change", () => {
+      const file = D.vvidFileInput.files?.[0];
+      D.btnVvidUpload.disabled = !file;
+    });
+  }
+  if (D.btnVvidUpload) {
+    D.btnVvidUpload.addEventListener("click", () => {
+      const file = D.vvidFileInput.files?.[0];
+      if (file) {
+        D.btnVvidUpload.disabled = true;
+        D.vvidFileInput.disabled = true;
+        convertAndUploadVideo(file);
+      }
+    });
+  }
+  if (D.btnPongStart) D.btnPongStart.addEventListener("click", startPongGame);
+  if (D.btnPongStop) D.btnPongStop.addEventListener("click", stopPongGame);
+
+  // Fetch videos initially
+  fetchVideos();
+
   log("INFO", "Ready. Click CONNECT.");
-  log("WARN", "Touch sensor 1: not populated on this unit — disabled.");
+  log("WARN", "Touch sensor 1: not populated on this unit - disabled.");
 });
