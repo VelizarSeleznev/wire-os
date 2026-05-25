@@ -2234,14 +2234,31 @@ void pongGameLoop() {
       int32_t curLeftEnc = snap.motor[0].position;
       int32_t curRightEnc = snap.motor[1].position;
       
+      double dLeft = 0.0;
+      double dRight = 0.0;
+      
+      if (curLeftEnc != lastLeftEnc) {
+        dLeft = (curLeftEnc > lastLeftEnc) ? 1.0 : -1.0;
+      }
+      if (curRightEnc != lastRightEnc) {
+        dRight = (curRightEnc > lastRightEnc) ? 1.0 : -1.0;
+      }
+      
       int32_t deltaLeft = curLeftEnc - lastLeftEnc;
       int32_t deltaRight = curRightEnc - lastRightEnc;
       
       lastLeftEnc = curLeftEnc;
       lastRightEnc = curRightEnc;
       
-      leftPadY += deltaRight * 0.35;
-      rightPadY -= deltaLeft * 0.35;
+      leftPadY += dRight * 2.0;
+      rightPadY -= dLeft * 2.0;
+      
+      if (deltaLeft != 0 || deltaRight != 0) {
+        printf("[PONG] L_enc=%d L_last=%d L_delta=%d | R_enc=%d R_last=%d R_delta=%d\n",
+               (int)curLeftEnc, (int)lastLeftEnc, (int)deltaLeft,
+               (int)curRightEnc, (int)lastRightEnc, (int)deltaRight);
+        printf("[PONG] leftPadY=%.2f rightPadY=%.2f\n", leftPadY, rightPadY);
+      }
       
       if (leftPadY < 2) leftPadY = 2;
       if (leftPadY > boardH - padH - 2) leftPadY = boardH - padH - 2;
