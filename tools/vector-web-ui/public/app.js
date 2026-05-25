@@ -68,18 +68,13 @@ const D = {
   btnMicRecord: $("btn-mic-record"),
   vmicStatus: $("vmic-status"),
   beamArrow: $("beam-arrow"),
-  // videos & pong
+  // videos
   vvidListContainer: $("vvid-list-container"),
   btnVvidRefresh: $("btn-vvid-refresh"),
   btnVvidStop: $("btn-vvid-stop"),
   vvidFileInput: $("vvid-file-input"),
   btnVvidUpload: $("btn-vvid-upload"),
   vvidUploadStatus: $("vvid-upload-status"),
-  btnPongStart: $("btn-pong-start"),
-  btnPongStop: $("btn-pong-stop"),
-  vpongStatus: $("vpong-status"),
-  vpongScoreLeft: $("vpong-score-left"),
-  vpongScoreRight: $("vpong-score-right"),
   micNodes: [
     $("mic-node-0"),
     $("mic-node-1"),
@@ -1665,67 +1660,6 @@ async function convertAndUploadVideo(file) {
   }
 }
 
-let pongPollTimer = null;
-
-function setPongStatus(text, cls = "") {
-  if (D.vpongStatus) {
-    D.vpongStatus.textContent = text;
-    D.vpongStatus.className = "val " + cls;
-  }
-}
-
-async function startPongGame() {
-  try {
-    log("INFO", "Starting track-controlled Pong...");
-    const res = await robotFetch("/games/pong/start", { method: "POST" });
-    if (!res.ok) throw new Error(await res.text());
-    
-    setPongStatus("ACTIVE", "ok");
-    log("OK", "Pong started! Rotate Vector's wheels to play.");
-    startPongPolling();
-  } catch (e) {
-    setPongStatus("ERROR", "bad");
-    log("ERROR", `Failed to start Pong: ${e.message}`);
-  }
-}
-
-async function stopPongGame() {
-  try {
-    const res = await robotFetch("/games/pong/stop", { method: "POST" });
-    if (!res.ok) throw new Error(await res.text());
-    
-    setPongStatus("INACTIVE");
-    log("INFO", "Pong game stopped.");
-    stopPongPolling();
-  } catch (e) {
-    log("ERROR", `Failed to stop Pong: ${e.message}`);
-  }
-}
-
-function startPongPolling() {
-  if (pongPollTimer) clearInterval(pongPollTimer);
-  pongPollTimer = setInterval(async () => {
-    try {
-      const res = await robotFetch("/games/pong/status");
-      if (res.ok) {
-        const data = await res.json();
-        if (data.active) {
-          D.vpongScoreLeft.textContent = data.score[0];
-          D.vpongScoreRight.textContent = data.score[1];
-        } else {
-          stopPongPolling();
-          setPongStatus("INACTIVE");
-        }
-      }
-    } catch (_) {}
-  }, 300);
-}
-
-function stopPongPolling() {
-  if (pongPollTimer) clearInterval(pongPollTimer);
-  pongPollTimer = null;
-}
-
 // ── Init ───────────────────────────────────────────────────────────────────
 window.addEventListener("load", () => {
   const saved = localStorage.getItem("vec-ip");
@@ -1760,7 +1694,7 @@ window.addEventListener("load", () => {
     log("INFO", "All motors stopped.");
   });
 
-  // Video and Pong controls
+  // Video controls
   if (D.btnVvidRefresh) D.btnVvidRefresh.addEventListener("click", fetchVideos);
   if (D.btnVvidStop) D.btnVvidStop.addEventListener("click", stopRobotVideo);
   if (D.vvidFileInput) {
@@ -1779,8 +1713,6 @@ window.addEventListener("load", () => {
       }
     });
   }
-  if (D.btnPongStart) D.btnPongStart.addEventListener("click", startPongGame);
-  if (D.btnPongStop) D.btnPongStop.addEventListener("click", stopPongGame);
 
   // Fetch videos initially
   fetchVideos();

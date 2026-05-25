@@ -2050,15 +2050,10 @@ class Spine {
 Spine gSpine;
 Lcd gLcd;
 
-// ── VVID Video Player & Pong Game Globals ──────────────────────────────────────
+// ── VVID Video Player Globals ──────────────────────────────────────
 std::atomic<bool> gVvidPlaying{false};
 std::thread gVvidThread;
 std::string gVvidCurrentName;
-
-std::atomic<bool> gPongActive{false};
-std::thread gPongThread;
-int gPongScoreLeft = 0;
-int gPongScoreRight = 0;
 
 void stopVvidPlaying() {
   if (gVvidPlaying.load()) {
@@ -2144,187 +2139,7 @@ void vvidPlayThread(std::string filepath) {
   gVvidPlaying.store(false);
 }
 
-namespace Pong {
-  // Retro 3x5 font digits 0-9
-  const uint8_t font3x5[10][5] = {
-    {0x7, 0x5, 0x5, 0x5, 0x7}, // 0
-    {0x2, 0x2, 0x2, 0x2, 0x2}, // 1
-    {0x7, 0x1, 0x7, 0x4, 0x7}, // 2
-    {0x7, 0x1, 0x7, 0x1, 0x7}, // 3
-    {0x5, 0x5, 0x7, 0x1, 0x1}, // 4
-    {0x7, 0x4, 0x7, 0x1, 0x7}, // 5
-    {0x7, 0x4, 0x7, 0x5, 0x7}, // 6
-    {0x7, 0x1, 0x1, 0x1, 0x1}, // 7
-    {0x7, 0x5, 0x7, 0x5, 0x7}, // 8
-    {0x7, 0x5, 0x7, 0x1, 0x7}  // 9
-  };
 
-  inline void drawPixel(uint16_t* buf, int x, int y, uint16_t color) {
-    if (x >= 0 && x < 184 && y >= 0 && y < 96) {
-      buf[y * 184 + x] = color;
-    }
-  }
-
-  inline void drawRect(uint16_t* buf, int x, int y, int w, int h, uint16_t color) {
-    for (int dy = 0; dy < h; ++dy) {
-      for (int dx = 0; dx < w; ++dx) {
-        drawPixel(buf, x + dx, y + dy, color);
-      }
-    }
-  }
-
-  inline void drawDigit(uint16_t* buf, int x, int y, int digit, uint16_t color, int scale = 2) {
-    if (digit < 0 || digit > 9) return;
-    for (int row = 0; row < 5; ++row) {
-      uint8_t bits = font3x5[digit][row];
-      for (int col = 0; col < 3; ++col) {
-        if ((bits >> (2 - col)) & 0x1) {
-          drawRect(buf, x + col * scale, y + row * scale, scale, scale, color);
-        }
-      }
-    }
-  }
-
-  inline void drawScore(uint16_t* buf, int leftScore, int rightScore) {
-    drawDigit(buf, 60, 10, leftScore % 10, 0xFFFF, 2);
-    if (leftScore >= 10) {
-      drawDigit(buf, 48, 10, (leftScore / 10) % 10, 0xFFFF, 2);
-    }
-    drawDigit(buf, 114, 10, rightScore % 10, 0xFFFF, 2);
-    if (rightScore >= 10) {
-      drawDigit(buf, 102, 10, (rightScore / 10) % 10, 0xFFFF, 2);
-    }
-  }
-}
-
-void pongGameLoop() {
-  const int boardW = 184;
-  const int boardH = 96;
-  
-  const int padW = 4;
-  const int padH = 20;
-  const int leftPadX = 10;
-  const int rightPadX = 184 - 10 - padW;
-  
-  double leftPadY = (boardH - padH) / 2.0;
-  double rightPadY = (boardH - padH) / 2.0;
-  
-  double ballX = boardW / 2.0;
-  double ballY = boardH / 2.0;
-  double ballDx = 2.5;
-  double ballDy = 1.2;
-  const int ballSize = 4;
-  
-  gPongScoreLeft = 0;
-  gPongScoreRight = 0;
-  
-  bool valid = false;
-  BodyToHead startSnap = gSpine.snapshot(&valid);
-  int32_t lastLeftEnc = valid ? startSnap.motor[0].position : 0;
-  int32_t lastRightEnc = valid ? startSnap.motor[1].position : 0;
-  
-  uint16_t frameBuf[184 * 96];
-  
-  auto nextTick = std::chrono::steady_clock::now();
-  const auto tickDuration = std::chrono::milliseconds(33); // 30 FPS
-  
-  while (gPongActive.load() && gRunning) {
-    BodyToHead snap = gSpine.snapshot(&valid);
-    if (valid) {
-      int32_t curLeftEnc = snap.motor[0].position;
-      int32_t curRightEnc = snap.motor[1].position;
-      
-      double dLeft = 0.0;
-      double dRight = 0.0;
-      
-      if (curLeftEnc != lastLeftEnc) {
-        dLeft = (curLeftEnc > lastLeftEnc) ? 1.0 : -1.0;
-      }
-      if (curRightEnc != lastRightEnc) {
-        dRight = (curRightEnc > lastRightEnc) ? 1.0 : -1.0;
-      }
-      
-      int32_t deltaLeft = curLeftEnc - lastLeftEnc;
-      int32_t deltaRight = curRightEnc - lastRightEnc;
-      
-      lastLeftEnc = curLeftEnc;
-      lastRightEnc = curRightEnc;
-      
-      leftPadY += dRight * 2.0;
-      rightPadY -= dLeft * 2.0;
-      
-      if (deltaLeft != 0 || deltaRight != 0) {
-        printf("[PONG] L_enc=%d L_last=%d L_delta=%d | R_enc=%d R_last=%d R_delta=%d\n",
-               (int)curLeftEnc, (int)lastLeftEnc, (int)deltaLeft,
-               (int)curRightEnc, (int)lastRightEnc, (int)deltaRight);
-        printf("[PONG] leftPadY=%.2f rightPadY=%.2f\n", leftPadY, rightPadY);
-      }
-      
-      if (leftPadY < 2) leftPadY = 2;
-      if (leftPadY > boardH - padH - 2) leftPadY = boardH - padH - 2;
-      
-      if (rightPadY < 2) rightPadY = 2;
-      if (rightPadY > boardH - padH - 2) rightPadY = boardH - padH - 2;
-    }
-    
-    ballX += ballDx;
-    ballY += ballDy;
-    
-    if (ballY <= 2) {
-      ballY = 2;
-      ballDy = -ballDy;
-    } else if (ballY >= boardH - ballSize - 2) {
-      ballY = boardH - ballSize - 2;
-      ballDy = -ballDy;
-    }
-    
-    if (ballX <= leftPadX + padW && ballX >= leftPadX && 
-        ballY + ballSize >= leftPadY && ballY <= leftPadY + padH) {
-      ballX = leftPadX + padW + 1;
-      ballDx = -ballDx;
-      double hitPos = (ballY + ballSize/2.0 - leftPadY) / padH;
-      ballDy = 4.0 * (hitPos - 0.5); 
-    }
-    
-    if (ballX + ballSize >= rightPadX && ballX + ballSize <= rightPadX + padW &&
-        ballY + ballSize >= rightPadY && ballY <= rightPadY + padH) {
-      ballX = rightPadX - ballSize - 1;
-      ballDx = -ballDx;
-      double hitPos = (ballY + ballSize/2.0 - rightPadY) / padH;
-      ballDy = 4.0 * (hitPos - 0.5);
-    }
-    
-    if (ballX < 0) {
-      gPongScoreRight++;
-      ballX = boardW / 2.0;
-      ballY = boardH / 2.0;
-      ballDx = 2.0;
-      ballDy = 1.0;
-    } else if (ballX > boardW) {
-      gPongScoreLeft++;
-      ballX = boardW / 2.0;
-      ballY = boardH / 2.0;
-      ballDx = -2.0;
-      ballDy = -1.0;
-    }
-    
-    std::fill(frameBuf, frameBuf + 184 * 96, 0x0000);
-    
-    for (int y = 4; y < boardH; y += 8) {
-      Pong::drawRect(frameBuf, boardW / 2 - 1, y, 2, 4, 0x7BEF);
-    }
-    
-    Pong::drawRect(frameBuf, leftPadX, static_cast<int>(leftPadY), padW, padH, 0xFFFF);
-    Pong::drawRect(frameBuf, rightPadX, static_cast<int>(rightPadY), padW, padH, 0xFFFF);
-    Pong::drawRect(frameBuf, static_cast<int>(ballX), static_cast<int>(ballY), ballSize, ballSize, 0x07FF); // Cyan ball
-    Pong::drawScore(frameBuf, gPongScoreLeft, gPongScoreRight);
-    
-    gLcd.drawFrame(std::string(reinterpret_cast<const char*>(frameBuf), 184 * 96 * 2));
-    
-    nextTick += tickDuration;
-    std::this_thread::sleep_until(nextTick);
-  }
-}
 
 void stopMotorsHard(int repeats = 8) {
   for (int i = 0; i < repeats; ++i) {
@@ -2967,7 +2782,7 @@ void handleClient(int fd) {
       sendJsonError(fd, 503, gLcd.lastError().empty() ? "display init failed" : gLcd.lastError());
     }
   } else if (method == "POST" && path == "/v1/display/frame") {
-    if (gVvidPlaying.load() || gPongActive.load()) {
+    if (gVvidPlaying.load()) {
       sendResponse(fd, 200, "OK", "{\"ok\":true,\"ignored\":true}");
     } else if (gLcd.drawFrame(body)) {
       sendResponse(fd, 200, "OK", "{\"ok\":true,\"width\":184,\"height\":96,\"format\":\"rgb565le\",\"panel\":\"" + gLcd.panelName() + "\"}");
@@ -2976,7 +2791,6 @@ void handleClient(int fd) {
     }
   } else if (method == "POST" && path == "/v1/display/stream") {
     stopVvidPlaying();
-    gPongActive.store(false);
     char frameBuf[kLcdWidth * kLcdHeight * 2]; // 35328 bytes
     while (gRunning) {
       size_t readBytes = 0;
@@ -2992,7 +2806,7 @@ void handleClient(int fd) {
         readBytes += n;
       }
       if (readBytes < sizeof(frameBuf)) break;
-      if (!gVvidPlaying.load() && !gPongActive.load()) {
+      if (!gVvidPlaying.load()) {
         gLcd.drawFrame(std::string(frameBuf, sizeof(frameBuf)));
       }
     }
@@ -3062,27 +2876,7 @@ void handleClient(int fd) {
         sendJsonError(fd, 404, "failed to delete or file not found");
       }
     }
-  } else if (method == "POST" && path == "/v1/games/pong/start") {
-    stopVvidPlaying();
-    if (gPongActive.load()) {
-      sendResponse(fd, 200, "OK", "{\"ok\":true,\"message\":\"already running\"}");
-    } else {
-      gPongActive.store(true);
-      gPongThread = std::thread(pongGameLoop);
-      gPongThread.detach();
-      sendResponse(fd, 200, "OK", "{\"ok\":true}");
-    }
-  } else if (method == "POST" && path == "/v1/games/pong/stop") {
-    if (gPongActive.load()) {
-      gPongActive.store(false);
-      if (gPongThread.joinable()) gPongThread.join();
-    }
-    sendResponse(fd, 200, "OK", "{\"ok\":true}");
-  } else if (method == "GET" && path == "/v1/games/pong/status") {
-    std::ostringstream out;
-    out << "{\"active\":" << (gPongActive.load() ? "true" : "false")
-        << ",\"score\":[" << gPongScoreLeft << "," << gPongScoreRight << "]}";
-    sendResponse(fd, 200, "OK", out.str());
+
   } else if (method == "GET" && path == "/v1/camera/snapshot") {
     gCameraEnabled.store(true);
     ensureCameraThreadStarted();
