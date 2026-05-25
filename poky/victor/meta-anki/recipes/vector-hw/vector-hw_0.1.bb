@@ -1,5 +1,6 @@
 SUMMARY = "Minimal Vector hardware HTTP/WebSocket API and local app runner"
 LICENSE = "CLOSED"
+PR = "r1"
 
 DEPENDS += "openssl"
 RDEPENDS:vector-hw-api += "bash"

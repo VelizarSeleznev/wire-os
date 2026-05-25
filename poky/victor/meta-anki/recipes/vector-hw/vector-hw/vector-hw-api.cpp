@@ -1,6 +1,7 @@
 #include <arpa/inet.h>
 #include <dirent.h>
 #include <fcntl.h>
+#include <grp.h>
 #include <netinet/in.h>
 #include <openssl/sha.h>
 #include <pthread.h>
@@ -21,6 +22,7 @@
 #include <atomic>
 #include <cerrno>
 #include <chrono>
+#include <condition_variable>
 #include <cctype>
 #include <cstdint>
 #include <cstdio>
@@ -38,7 +40,7 @@
 
 namespace {
 
-constexpr const char* kApiVersion = "0.2.0";
+constexpr const char* kApiVersion = "0.2.1";
 constexpr const char* kSpineDevice = "/dev/ttyHS0";
 constexpr const char* kLcdDevice = "/dev/spidev1.0";
 constexpr const char* kImuDevice = "/dev/spidev0.0";
@@ -62,6 +64,17 @@ constexpr int kAudioMixerMax = 74;
 constexpr int kCameraStreamFps = 7;   // target fps for MJPEG stream
 constexpr int kCameraStreamMs = 1000 / kCameraStreamFps;
 constexpr int kMotorPositionTtlMs = 10000;  // max time for a position command
+constexpr uint32_t kAnkiCameraMaxFrames = 6;
+constexpr uint32_t kAnkiCameraMsgPayloadLen = 128;
+constexpr uint32_t kAnkiCameraMsgClientHeartbeat = 0;
+constexpr uint32_t kAnkiCameraMsgClientRegister = 1;
+constexpr uint32_t kAnkiCameraMsgClientUnregister = 2;
+constexpr uint32_t kAnkiCameraMsgClientStart = 3;
+constexpr uint32_t kAnkiCameraMsgClientParams = 5;
+constexpr uint32_t kAnkiCameraMsgServerStatus = 6;
+constexpr uint32_t kAnkiCameraMsgServerBuffer = 7;
+constexpr uint32_t kAnkiCameraParamsFormat = 2;
+constexpr uint32_t kAnkiCameraFormatRgb888 = 1;
 
 #pragma pack(push, 1)
 struct MotorState {
@@ -122,6 +135,27 @@ struct HeadToBody {
   LightState lightState;
   uint8_t unused[32];
 };
+
+struct AnkiCameraMsg {
+  uint32_t msg_id;
+  uint32_t version;
+  uint32_t client_id;
+  int32_t fd;
+  uint8_t payload[kAnkiCameraMsgPayloadLen];
+};
+
+struct AnkiCameraFrame {
+  uint64_t timestamp;
+  uint32_t frame_id;
+  uint32_t width;
+  uint32_t height;
+  uint32_t bytes_per_row;
+  uint8_t bits_per_pixel;
+  uint8_t format;
+  uint8_t reserved[2];
+  uint32_t pad_to_64[8];
+  uint8_t data[0];
+};
 #pragma pack(pop)
 
 constexpr uint32_t kSyncBodyToHead = 0x483242aa;
@@ -143,6 +177,25 @@ uint32_t crc32(const uint8_t* data, size_t len) {
 
 bool exists(const std::string& path) {
   return access(path.c_str(), F_OK) == 0;
+}
+
+void joinSupplementaryGroupIfPresent(const char* groupName) {
+  if (geteuid() != 0 || !groupName) return;
+  group* gr = getgrnam(groupName);
+  if (!gr) return;
+
+  int groupCount = getgroups(0, nullptr);
+  if (groupCount < 0) return;
+
+  std::vector<gid_t> groups(static_cast<size_t>(groupCount));
+  if (groupCount > 0 && getgroups(groupCount, groups.data()) < 0) return;
+
+  if (std::find(groups.begin(), groups.end(), gr->gr_gid) != groups.end()) return;
+  groups.push_back(gr->gr_gid);
+  if (setgroups(static_cast<int>(groups.size()), groups.data()) != 0) {
+    printf("[Init] failed to join group %s: %s\n", groupName, strerror(errno));
+    fflush(stdout);
+  }
 }
 
 std::string readFile(const std::string& path, size_t maxBytes = 1024 * 1024) {
@@ -235,18 +288,32 @@ int runCommand(const std::string& cmd) {
   return 128;
 }
 
+bool processMatchesCommNonZombie(pid_t pid, const char* commName) {
+  if (pid <= 0) return false;
+  std::string procBase = std::string("/proc/") + std::to_string(pid);
+  std::string comm = readFile(procBase + "/comm", 128);
+  while (!comm.empty() && (comm.back() == '\n' || comm.back() == '\r')) comm.pop_back();
+  if (comm != commName) return false;
+
+  std::string stat = readFile(procBase + "/stat", 512);
+  size_t closeParen = stat.rfind(')');
+  if (closeParen != std::string::npos && closeParen + 2 < stat.size()) {
+    char state = stat[closeParen + 2];
+    if (state == 'Z') return false;
+  }
+  return true;
+}
+
 pid_t findProcessByComm(const char* commName) {
   DIR* dir = opendir("/proc");
   if (!dir) return -1;
   struct dirent* ent = nullptr;
   while ((ent = readdir(dir)) != nullptr) {
     if (!std::all_of(ent->d_name, ent->d_name + std::strlen(ent->d_name), ::isdigit)) continue;
-    std::string commPath = std::string("/proc/") + ent->d_name + "/comm";
-    std::string comm = readFile(commPath, 128);
-    while (!comm.empty() && (comm.back() == '\n' || comm.back() == '\r')) comm.pop_back();
-    if (comm == commName) {
+    pid_t pid = static_cast<pid_t>(std::atoi(ent->d_name));
+    if (processMatchesCommNonZombie(pid, commName)) {
       closedir(dir);
-      return static_cast<pid_t>(std::atoi(ent->d_name));
+      return pid;
     }
   }
   closedir(dir);
@@ -258,6 +325,11 @@ std::atomic<int> gAudioVolumePercent{100};
 // ── Camera daemon management ────────────────────────────────────────────────
 std::atomic<pid_t> gCameraDaemonPid{-1};
 std::atomic<pid_t> gAnkiCameraPid{-1};
+
+void reapExitedChildren() {
+  int status = 0;
+  while (waitpid(-1, &status, WNOHANG) > 0) {}
+}
 
 void appendLe16(std::string& out, uint16_t v) {
   out.push_back(static_cast<char>(v & 0xff));
@@ -272,7 +344,22 @@ void appendLe32(std::string& out, uint32_t v) {
 }
 
 bool startCameraDaemon(std::string& error) {
+  reapExitedChildren();
+  // Reap any zombie camera child from a previous run before checking PIDs.
+  pid_t ankiPid = gAnkiCameraPid.load();
+  if (ankiPid > 0) {
+    int zombieStatus = 0;
+    pid_t reaped = waitpid(ankiPid, &zombieStatus, WNOHANG);
+    if (reaped == ankiPid) {
+      // Child exited — clear the stored PID so we'll restart it.
+      printf("[Camera] mm-anki-camera (pid %d) reaped, status=%d\n", (int)ankiPid, zombieStatus);
+      fflush(stdout);
+      gAnkiCameraPid.store(-1);
+    }
+  }
+
   pid_t existing = gCameraDaemonPid.load();
+  if (existing > 0 && !processMatchesCommNonZombie(existing, "mm-qcamera-daem")) existing = -1;
   if (existing <= 0) existing = findProcessByComm("mm-qcamera-daem");
   if (existing > 0) {
     gCameraDaemonPid.store(existing);
@@ -312,7 +399,23 @@ bool startCameraDaemon(std::string& error) {
     std::this_thread::sleep_for(std::chrono::milliseconds(700));
   }
 
-  if (exists(kAnkiCameraSocket)) return true;
+  pid_t existingAnki = gAnkiCameraPid.load();
+  if (existingAnki > 0 &&
+      !processMatchesCommNonZombie(existingAnki, "mm-anki-camera") &&
+      !processMatchesCommNonZombie(existingAnki, "mm-anki-camera-")) {
+    existingAnki = -1;
+  }
+  if (existingAnki <= 0) {
+    existingAnki = findProcessByComm("mm-anki-camera");
+    if (existingAnki <= 0) existingAnki = findProcessByComm("mm-anki-camera-");
+  }
+  if (exists(kAnkiCameraSocket) && existingAnki > 0) {
+    gAnkiCameraPid.store(existingAnki);
+    return true;
+  }
+  if (exists(kAnkiCameraSocket) && existingAnki <= 0) {
+    unlink(kAnkiCameraSocket);
+  }
 
   const char* wrappers[] = {
     "/usr/bin/mm-anki-camera-wrapper",
@@ -342,7 +445,9 @@ bool startCameraDaemon(std::string& error) {
       dup2(devNull, STDERR_FILENO);
       close(devNull);
     }
-    execl(wrapper, wrapper, "-v", "1", "-r", "1", "-C", nullptr);
+    // The API now owns the camera client lifecycle: register, start, heartbeat,
+    // and format selection are sent over the camera IPC socket.
+    execl(wrapper, wrapper, "-v", "0", "-r", "1", nullptr);
     _exit(1);
   }
   gAnkiCameraPid.store(pid);
@@ -366,6 +471,23 @@ void stopCameraDaemon() {
   runCommand("killall mm-qcamera-daemon >/dev/null 2>&1");
   runCommand("killall mm-anki-camera >/dev/null 2>&1");
   runCommand("killall mm-anki-camera-wrapper >/dev/null 2>&1");
+}
+
+void restartAnkiCameraProducer(const char* reason) {
+  printf("[Camera] Restarting mm-anki-camera producer: %s\n", reason ? reason : "unknown");
+  fflush(stdout);
+
+  pid_t pid = gAnkiCameraPid.exchange(-1);
+  if (pid > 0) {
+    kill(pid, SIGKILL);
+    int status = 0;
+    waitpid(pid, &status, WNOHANG);
+  }
+  reapExitedChildren();
+  runCommand("killall -9 mm-anki-camera >/dev/null 2>&1");
+  runCommand("killall -9 mm-anki-camera-wrapper >/dev/null 2>&1");
+  reapExitedChildren();
+  unlink(kAnkiCameraSocket);
 }
 
 bool cameraSnapshotAge(long& ageMs) {
@@ -406,6 +528,92 @@ bool receiveFdMessage(int sock, uint8_t* data, size_t dataLen, ssize_t& received
   return true;
 }
 
+bool receiveCameraMessage(int sock, AnkiCameraMsg& msgOut, int& receivedFd) {
+  char ctrl[CMSG_SPACE(sizeof(int) * 4)];
+  iovec iov{};
+  iov.iov_base = &msgOut;
+  iov.iov_len = sizeof(msgOut);
+  msghdr msg{};
+  msg.msg_iov = &iov;
+  msg.msg_iovlen = 1;
+  msg.msg_control = ctrl;
+  msg.msg_controllen = sizeof(ctrl);
+
+  receivedFd = -1;
+  std::memset(&msgOut, 0, sizeof(msgOut));
+  ssize_t receivedLen = recvmsg(sock, &msg, MSG_DONTWAIT);
+  if (receivedLen < 0) return false;
+  if (receivedLen != static_cast<ssize_t>(sizeof(msgOut))) return false;
+
+  for (cmsghdr* c = CMSG_FIRSTHDR(&msg); c; c = CMSG_NXTHDR(&msg, c)) {
+    if (c->cmsg_level == SOL_SOCKET && c->cmsg_type == SCM_RIGHTS) {
+      int* fds = reinterpret_cast<int*>(CMSG_DATA(c));
+      int count = static_cast<int>((c->cmsg_len - CMSG_LEN(0)) / sizeof(int));
+      if (count > 0) {
+        receivedFd = fds[0];
+        for (int i = 1; i < count; ++i) close(fds[i]);
+      }
+    }
+  }
+  return true;
+}
+
+bool sendCameraMessage(int sock, uint32_t msgId, const void* payload = nullptr, size_t payloadLen = 0) {
+  AnkiCameraMsg msg{};
+  msg.msg_id = msgId;
+  if (payload && payloadLen > 0) {
+    if (payloadLen > sizeof(msg.payload)) return false;
+    std::memcpy(msg.payload, payload, payloadLen);
+  }
+  return writeAllFd(sock, &msg, sizeof(msg));
+}
+
+bool sendCameraFormatMessage(int sock, uint32_t format) {
+  struct FormatPayload {
+    uint32_t id;
+    uint32_t format;
+  } payload{kAnkiCameraParamsFormat, format};
+  return sendCameraMessage(sock, kAnkiCameraMsgClientParams, &payload, sizeof(payload));
+}
+
+std::string makeBmpFromRgb888(const uint8_t* rgb, int width, int height, int stride) {
+  if (!rgb || width <= 0 || height <= 0 || stride < width * 3) return "";
+  const int rowBytes = ((width * 3 + 3) / 4) * 4;
+  const uint32_t pixelBytes = static_cast<uint32_t>(rowBytes * height);
+  std::string bmp;
+  bmp.reserve(14 + 40 + pixelBytes);
+  bmp.push_back('B');
+  bmp.push_back('M');
+  appendLe32(bmp, 14 + 40 + pixelBytes);
+  appendLe16(bmp, 0);
+  appendLe16(bmp, 0);
+  appendLe32(bmp, 14 + 40);
+  appendLe32(bmp, 40);
+  appendLe32(bmp, static_cast<uint32_t>(width));
+  appendLe32(bmp, static_cast<uint32_t>(-height));
+  appendLe16(bmp, 1);
+  appendLe16(bmp, 24);
+  appendLe32(bmp, 0);
+  appendLe32(bmp, pixelBytes);
+  appendLe32(bmp, 2835);
+  appendLe32(bmp, 2835);
+  appendLe32(bmp, 0);
+  appendLe32(bmp, 0);
+
+  std::string pad(rowBytes - width * 3, '\0');
+  for (int y = 0; y < height; ++y) {
+    const uint8_t* row = rgb + y * stride;
+    for (int x = 0; x < width; ++x) {
+      const uint8_t* px = row + x * 3;
+      bmp.push_back(static_cast<char>(px[2]));
+      bmp.push_back(static_cast<char>(px[1]));
+      bmp.push_back(static_cast<char>(px[0]));
+    }
+    bmp += pad;
+  }
+  return bmp;
+}
+
 void unpackRaw10ContinuousRow(const uint8_t* row, int width, std::vector<uint16_t>& out) {
   out.assign(width, 0);
   int x = 0;
@@ -425,29 +633,175 @@ void unpackRaw10ContinuousRow(const uint8_t* row, int width, std::vector<uint16_
   }
 }
 
-std::string makeGrayscaleBmpFromRaw10(const uint8_t* raw, int width, int height, int stride) {
+enum class BayerPattern {
+  BGGR,
+  GBRG,
+  GRBG,
+  RGGB
+};
+
+BayerPattern parseBayerPattern(const std::string& str, BayerPattern def = BayerPattern::GBRG) {
+  if (str == "BGGR" || str == "bggr") return BayerPattern::BGGR;
+  if (str == "GBRG" || str == "gbrg") return BayerPattern::GBRG;
+  if (str == "GRBG" || str == "grbg") return BayerPattern::GRBG;
+  if (str == "RGGB" || str == "rggb") return BayerPattern::RGGB;
+  return def;
+}
+
+std::string makeColorBmpFromRaw10(const uint8_t* raw, int width, int height, int stride, BayerPattern pattern = BayerPattern::GBRG) {
   const int outW = width / 2;
   const int outH = height / 2;
   std::vector<uint16_t> row0;
   std::vector<uint16_t> row1;
-  std::vector<uint16_t> gray(outW * outH);
-  uint32_t hist[1024]{};
+  std::vector<uint16_t> r_chan(outW * outH);
+  std::vector<uint16_t> g_chan(outW * outH);
+  std::vector<uint16_t> b_chan(outW * outH);
+  uint32_t histR[1024]{};
+  uint32_t histG[1024]{};
+  uint32_t histB[1024]{};
 
   for (int y = 0; y < outH; ++y) {
     unpackRaw10ContinuousRow(raw + (y * 2) * stride, width, row0);
     unpackRaw10ContinuousRow(raw + (y * 2 + 1) * stride, width, row1);
     for (int x = 0; x < outW; ++x) {
-      uint16_t v = static_cast<uint16_t>((row0[x * 2] + row0[x * 2 + 1] +
-                                          row1[x * 2] + row1[x * 2 + 1]) / 4);
+      uint16_t b = 0, g = 0, r = 0;
+      switch (pattern) {
+        case BayerPattern::BGGR:
+          b = row0[x * 2];
+          g = (row0[x * 2 + 1] + row1[x * 2]) / 2;
+          r = row1[x * 2 + 1];
+          break;
+        case BayerPattern::GBRG:
+          g = (row0[x * 2] + row1[x * 2 + 1]) / 2;
+          b = row0[x * 2 + 1];
+          r = row1[x * 2];
+          break;
+        case BayerPattern::GRBG:
+          g = (row0[x * 2] + row1[x * 2 + 1]) / 2;
+          r = row0[x * 2 + 1];
+          b = row1[x * 2];
+          break;
+        case BayerPattern::RGGB:
+          r = row0[x * 2];
+          g = (row0[x * 2 + 1] + row1[x * 2]) / 2;
+          b = row1[x * 2 + 1];
+          break;
+      }
+
+      b = std::min<uint16_t>(b, 1023);
+      g = std::min<uint16_t>(g, 1023);
+      r = std::min<uint16_t>(r, 1023);
+
+      int idx = y * outW + x;
+      r_chan[idx] = r;
+      g_chan[idx] = g;
+      b_chan[idx] = b;
+
+      histR[r]++;
+      histG[g]++;
+      histB[b]++;
+    }
+  }
+
+  const uint32_t total = static_cast<uint32_t>(outW * outH);
+  const uint32_t lowCut = total / 150;
+  const uint32_t highCut = total - lowCut;
+
+  auto getBounds = [&](const uint32_t* hist, int& low, int& high) {
+    uint32_t acc = 0;
+    low = 0;
+    high = 1023;
+    for (int i = 0; i < 1024; ++i) {
+      acc += hist[i];
+      if (acc >= lowCut) { low = i; break; }
+    }
+    acc = 0;
+    for (int i = 0; i < 1024; ++i) {
+      acc += hist[i];
+      if (acc >= highCut) { high = i; break; }
+    }
+    if (high <= low) high = low + 1;
+  };
+
+  int lowR, highR;
+  int lowG, highG;
+  int lowB, highB;
+  getBounds(histR, lowR, highR);
+  getBounds(histG, lowG, highG);
+  getBounds(histB, lowB, highB);
+
+  const int rowBytes = ((outW * 3 + 3) / 4) * 4;
+  const uint32_t pixelBytes = static_cast<uint32_t>(rowBytes * outH);
+  std::string bmp;
+  bmp.reserve(14 + 40 + pixelBytes);
+  bmp.push_back('B');
+  bmp.push_back('M');
+  appendLe32(bmp, 14 + 40 + pixelBytes);
+  appendLe16(bmp, 0);
+  appendLe16(bmp, 0);
+  appendLe32(bmp, 14 + 40);
+  appendLe32(bmp, 40);
+  appendLe32(bmp, static_cast<uint32_t>(outW));
+  appendLe32(bmp, static_cast<uint32_t>(-outH));
+  appendLe16(bmp, 1);
+  appendLe16(bmp, 24);
+  appendLe32(bmp, 0);
+  appendLe32(bmp, pixelBytes);
+  appendLe32(bmp, 2835);
+  appendLe32(bmp, 2835);
+  appendLe32(bmp, 0);
+  appendLe32(bmp, 0);
+
+  std::string pad(rowBytes - outW * 3, '\0');
+  for (int y = 0; y < outH; ++y) {
+    for (int x = 0; x < outW; ++x) {
+      int idx = y * outW + x;
+      int r = r_chan[idx];
+      int g = g_chan[idx];
+      int b = b_chan[idx];
+
+      int scaledR = std::clamp((r - lowR) * 255 / (highR - lowR), 0, 255);
+      int scaledG = std::clamp((g - lowG) * 255 / (highG - lowG), 0, 255);
+      int scaledB = std::clamp((b - lowB) * 255 / (highB - lowB), 0, 255);
+
+      bmp.push_back(static_cast<char>(scaledB));
+      bmp.push_back(static_cast<char>(scaledG));
+      bmp.push_back(static_cast<char>(scaledR));
+    }
+    bmp += pad;
+  }
+  return bmp;
+}
+
+std::string makeGrayBmpFromRaw10(const uint8_t* raw, int width, int height, int stride) {
+  const int block = 4;
+  const int outW = width / block;
+  const int outH = height / block;
+  std::vector<uint16_t> rows[block];
+  std::vector<uint16_t> gray(outW * outH);
+  uint32_t hist[1024]{};
+
+  for (int y = 0; y < outH; ++y) {
+    for (int r = 0; r < block; ++r) {
+      unpackRaw10ContinuousRow(raw + (y * block + r) * stride, width, rows[r]);
+    }
+    for (int x = 0; x < outW; ++x) {
+      uint32_t sum = 0;
+      for (int r = 0; r < block; ++r) {
+        for (int c = 0; c < block; ++c) {
+          sum += rows[r][x * block + c];
+        }
+      }
+      uint16_t v = static_cast<uint16_t>(sum / (block * block));
       v = std::min<uint16_t>(v, 1023);
       gray[y * outW + x] = v;
       hist[v]++;
     }
   }
 
-  const uint32_t total = static_cast<uint32_t>(gray.size());
-  const uint32_t lowCut = total / 100;
-  const uint32_t highCut = total - total / 100;
+  const uint32_t total = static_cast<uint32_t>(outW * outH);
+  const uint32_t lowCut = total / 150;
+  const uint32_t highCut = total - lowCut;
   uint32_t acc = 0;
   int low = 0;
   int high = 1023;
@@ -474,7 +828,7 @@ std::string makeGrayscaleBmpFromRaw10(const uint8_t* raw, int width, int height,
   appendLe32(bmp, 14 + 40);
   appendLe32(bmp, 40);
   appendLe32(bmp, static_cast<uint32_t>(outW));
-  appendLe32(bmp, static_cast<uint32_t>(-outH));  // top-down BMP
+  appendLe32(bmp, static_cast<uint32_t>(-outH));
   appendLe16(bmp, 1);
   appendLe16(bmp, 24);
   appendLe32(bmp, 0);
@@ -487,139 +841,345 @@ std::string makeGrayscaleBmpFromRaw10(const uint8_t* raw, int width, int height,
   std::string pad(rowBytes - outW * 3, '\0');
   for (int y = 0; y < outH; ++y) {
     for (int x = 0; x < outW; ++x) {
-      int v = gray[y * outW + x];
-      int scaled = std::clamp((v - low) * 255 / (high - low), 0, 255);
-      char c = static_cast<char>(scaled);
-      bmp.push_back(c);
-      bmp.push_back(c);
-      bmp.push_back(c);
+      int scaled = std::clamp((gray[y * outW + x] - low) * 255 / (high - low), 0, 255);
+      bmp.push_back(static_cast<char>(scaled));
+      bmp.push_back(static_cast<char>(scaled));
+      bmp.push_back(static_cast<char>(scaled));
     }
     bmp += pad;
   }
   return bmp;
 }
 
-bool captureCameraSnapshotBmp(std::string& image, std::string& error) {
-  if (!startCameraDaemon(error)) return false;
+std::thread gCameraThread;
+std::atomic<bool> gCameraThreadStarted{false};
+std::atomic<bool> gCameraEnabled{true};
+std::mutex gCameraFrameMutex;
+std::condition_variable gCameraFrameCond;
+std::vector<uint8_t> gLatestRawFrameBytes;
+int gLatestRawFrameWidth = 0;
+int gLatestRawFrameHeight = 0;
+int gLatestRawFrameStride = 0;
+int gLatestRawFrameFormat = -1;
+uint32_t gLatestRawFrameNum = 0;
+uint64_t gLatestCameraSeq = 0;
+std::string gLatestDefaultBmpBytes;
 
-  int sock = socket(AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC, 0);
-  if (sock < 0) {
-    error = "camera client socket failed: " + std::string(strerror(errno));
-    return false;
-  }
+void cameraThreadLoop() {
+  printf("[Camera] Thread started\n");
+  fflush(stdout);
 
-  timeval tv{};
-  tv.tv_sec = 3;
-  setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+  int sock = -1;
+  void* mapped = nullptr;
+  size_t mapLen = 0;
+  int mappedFd = -1;
+  uint32_t lastFrameNum = 0;
+  auto lastFrameAt = std::chrono::steady_clock::now();
+  auto lastHeartbeatAt = std::chrono::steady_clock::now();
+  bool registered = false;
+  bool started = false;
+  bool requestedRgb = false;
+  char localPath[108] = {};
 
-  char localPath[108];
-  snprintf(localPath, sizeof(localPath), "/tmp/vector-camera-%d-%ld.sock",
-           getpid(), static_cast<long>(time(nullptr)));
-  unlink(localPath);
-
-  sockaddr_un local{};
-  local.sun_family = AF_UNIX;
-  snprintf(local.sun_path, sizeof(local.sun_path), "%s", localPath);
-  if (bind(sock, reinterpret_cast<sockaddr*>(&local), sizeof(local)) != 0) {
-    error = "camera client bind failed: " + std::string(strerror(errno));
-    close(sock);
-    unlink(localPath);
-    return false;
-  }
-
-  sockaddr_un server{};
-  server.sun_family = AF_UNIX;
-  snprintf(server.sun_path, sizeof(server.sun_path), "%s", kAnkiCameraSocket);
-
-  uint32_t request[4]{1, 0, 0, 0};
-  ssize_t sent = sendto(sock, request, sizeof(request), 0,
-                        reinterpret_cast<sockaddr*>(&server), sizeof(server));
-  if (sent != static_cast<ssize_t>(sizeof(request))) {
-    error = "camera connect message failed: " + std::string(strerror(errno));
-    close(sock);
-    unlink(localPath);
-    return false;
-  }
-
-  uint8_t response[256]{};
-  ssize_t responseLen = 0;
-  int sharedFd = -1;
-  if (!receiveFdMessage(sock, response, sizeof(response), responseLen, sharedFd) || sharedFd < 0) {
-    error = "camera did not return shared-memory fd";
-    close(sock);
-    unlink(localPath);
-    return false;
-  }
-
-  uint32_t* rw = reinterpret_cast<uint32_t*>(response);
-  size_t mapLen = (responseLen >= 20 && rw[4] > 0 && rw[4] < 64 * 1024 * 1024)
-                    ? rw[4]
-                    : 8 * 1024 * 1024;
-  void* mapped = mmap(nullptr, mapLen, PROT_READ, MAP_SHARED, sharedFd, 0);
-  close(sharedFd);
-  if (mapped == MAP_FAILED) {
-    error = "camera mmap failed: " + std::string(strerror(errno));
-    close(sock);
-    unlink(localPath);
-    return false;
-  }
-
-  std::this_thread::sleep_for(std::chrono::milliseconds(350));
-
-  const uint8_t* mem = static_cast<const uint8_t*>(mapped);
-  const uint32_t* hdr = reinterpret_cast<const uint32_t*>(mem);
-  if (mapLen < 128 || hdr[0] != 0x304d4143) {
-    error = "camera shared memory has invalid CAM0 header";
-    munmap(mapped, mapLen);
-    close(sock);
-    unlink(localPath);
-    return false;
-  }
-
-  int slotCount = static_cast<int>(std::min<uint32_t>(hdr[8], 6));
-  int width = static_cast<int>(hdr[19]);
-  int height = static_cast<int>(hdr[20]);
-  int stride = static_cast<int>(hdr[21]);
-  int format = static_cast<int>(hdr[22]);
-  if (slotCount <= 0 || width <= 0 || height <= 0 || stride <= 0 || format != 10) {
-    error = "unsupported camera buffer format";
-    munmap(mapped, mapLen);
-    close(sock);
-    unlink(localPath);
-    return false;
-  }
-
-  int bestSlot = 0;
-  uint32_t bestFrame = 0;
-  for (int i = 0; i < slotCount; ++i) {
-    uint32_t off = hdr[10 + i];
-    if (off + 0x40 + static_cast<uint32_t>(height * stride) > mapLen) continue;
-    const uint32_t* slotHdr = reinterpret_cast<const uint32_t*>(mem + off);
-    if (i == 0 || slotHdr[2] >= bestFrame) {
-      bestFrame = slotHdr[2];
-      bestSlot = i;
+  auto lockAllSlots = [&]() {
+    if (!mapped || mapLen < 64) return;
+    auto* hdr = reinterpret_cast<uint32_t*>(mapped);
+    if (hdr[0] != 0x304d4143) return;
+    uint32_t slotCount = std::min<uint32_t>(hdr[8], kAnkiCameraMaxFrames);
+    for (uint32_t slot = 0; slot < slotCount; ++slot) {
+      uint32_t unlocked = 0;
+      __atomic_compare_exchange_n(&hdr[2 + slot], &unlocked, 1, false,
+                                  __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
     }
-  }
-  uint32_t rawOffset = hdr[10 + bestSlot] + 0x40;
-  if (rawOffset + static_cast<uint32_t>(height * stride) > mapLen) {
-    error = "camera frame offset outside shared memory";
-    munmap(mapped, mapLen);
-    close(sock);
-    unlink(localPath);
-    return false;
+  };
+
+  auto unlockAllSlots = [&]() {
+    if (!mapped || mapLen < 64) return;
+    auto* hdr = reinterpret_cast<uint32_t*>(mapped);
+    if (hdr[0] != 0x304d4143) return;
+    for (uint32_t slot = 0; slot < kAnkiCameraMaxFrames; ++slot) {
+      uint32_t locked = 1;
+      __atomic_compare_exchange_n(&hdr[2 + slot], &locked, 0, false,
+                                  __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+    }
+  };
+
+  auto closeSock = [&]() {
+    unlockAllSlots();
+    if (sock >= 0) {
+      sendCameraMessage(sock, kAnkiCameraMsgClientUnregister);
+    }
+    if (sock >= 0) { close(sock); sock = -1; }
+    if (mappedFd >= 0) { close(mappedFd); mappedFd = -1; }
+    if (localPath[0]) { unlink(localPath); localPath[0] = '\0'; }
+    if (mapped) { munmap(mapped, mapLen); mapped = nullptr; }
+    mapLen = 0;
+    lastFrameNum = 0;
+    lastFrameAt = std::chrono::steady_clock::now();
+    lastHeartbeatAt = std::chrono::steady_clock::now();
+    registered = false;
+    started = false;
+    requestedRgb = false;
+  };
+
+  while (gRunning) {
+    if (!gCameraEnabled.load()) {
+      closeSock();
+      std::this_thread::sleep_for(std::chrono::milliseconds(200));
+      continue;
+    }
+
+    if (sock < 0) {
+      std::string error;
+      if (!startCameraDaemon(error)) {
+        printf("[Camera] Failed to start daemon: %s. Retrying in 1s...\n", error.c_str());
+        fflush(stdout);
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+        continue;
+      }
+
+      sock = socket(AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
+      if (sock < 0) {
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+        continue;
+      }
+
+      // CRITICAL: bind to a local path and KEEP IT ALIVE.
+      // The camera server (mm-anki-camera) sends frame-ready notifications
+      // back to this address via sendto(). If we unlink() the path, the
+      // server's sendto() returns ENOENT, it concludes the client is dead,
+      // stops streaming, and eventually exits. We must NOT unlink until we
+      // are done and closing the socket.
+      snprintf(localPath, sizeof(localPath), "/tmp/vector-camera-thread-%d-%ld.sock",
+               getpid(), static_cast<long>(time(nullptr)));
+      unlink(localPath);  // Remove any stale file from a previous crash.
+
+      sockaddr_un local{};
+      local.sun_family = AF_UNIX;
+      snprintf(local.sun_path, sizeof(local.sun_path), "%s", localPath);
+      if (bind(sock, reinterpret_cast<sockaddr*>(&local), sizeof(local)) != 0) {
+        printf("[Camera] bind failed: %s\n", strerror(errno));
+        fflush(stdout);
+        close(sock); sock = -1;
+        localPath[0] = '\0';
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+        continue;
+      }
+
+      sockaddr_un server{};
+      server.sun_family = AF_UNIX;
+      snprintf(server.sun_path, sizeof(server.sun_path), "%s", kAnkiCameraSocket);
+
+      if (connect(sock, reinterpret_cast<sockaddr*>(&server), sizeof(server)) != 0) {
+        printf("[Camera] connect failed: %s\n", strerror(errno));
+        fflush(stdout);
+        closeSock();
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+        continue;
+      }
+
+      if (!sendCameraMessage(sock, kAnkiCameraMsgClientRegister)) {
+        printf("[Camera] client register failed: %s\n", strerror(errno));
+        fflush(stdout);
+        closeSock();
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+        continue;
+      }
+      registered = true;
+      printf("[Camera] Registered camera client\n");
+      fflush(stdout);
+    }
+
+    for (;;) {
+      AnkiCameraMsg msg{};
+      int receivedFd = -1;
+      if (!receiveCameraMessage(sock, msg, receivedFd)) {
+        if (receivedFd >= 0) close(receivedFd);
+        break;
+      }
+
+      if (msg.msg_id == kAnkiCameraMsgServerBuffer && receivedFd >= 0) {
+        uint32_t newMapLen = 0;
+        std::memcpy(&newMapLen, msg.payload, sizeof(newMapLen));
+        if (newMapLen == 0 || newMapLen > 64 * 1024 * 1024) {
+          close(receivedFd);
+          continue;
+        }
+        unlockAllSlots();
+        if (mapped) {
+          munmap(mapped, mapLen);
+          mapped = nullptr;
+        }
+        if (mappedFd >= 0) close(mappedFd);
+        mapLen = newMapLen;
+        mappedFd = receivedFd;
+        mapped = mmap(nullptr, mapLen, PROT_READ | PROT_WRITE, MAP_SHARED, mappedFd, 0);
+        if (mapped == MAP_FAILED) {
+          printf("[Camera] mmap failed: %s\n", strerror(errno));
+          fflush(stdout);
+          mapped = nullptr;
+          closeSock();
+          std::this_thread::sleep_for(std::chrono::milliseconds(500));
+          break;
+        }
+        lastFrameNum = 0;
+        lastFrameAt = std::chrono::steady_clock::now();
+        printf("[Camera] Mapped camera buffer: %zu bytes\n", mapLen);
+        fflush(stdout);
+      } else if (msg.msg_id == kAnkiCameraMsgServerStatus) {
+        uint32_t ack = msg.payload[0];
+        if (ack == kAnkiCameraMsgClientRegister && registered && !started) {
+          if (sendCameraMessage(sock, kAnkiCameraMsgClientStart)) {
+            started = true;
+            printf("[Camera] Start requested\n");
+            fflush(stdout);
+          }
+        } else if (ack == kAnkiCameraMsgClientStart && !requestedRgb) {
+          lockAllSlots();
+          if (sendCameraFormatMessage(sock, kAnkiCameraFormatRgb888)) {
+            requestedRgb = true;
+            printf("[Camera] RGB888 format requested\n");
+            fflush(stdout);
+          }
+        }
+      }
+    }
+
+    auto now = std::chrono::steady_clock::now();
+    if (now - lastHeartbeatAt > std::chrono::milliseconds(200)) {
+      if (!sendCameraMessage(sock, kAnkiCameraMsgClientHeartbeat)) {
+        printf("[Camera] heartbeat failed: %s\n", strerror(errno));
+        fflush(stdout);
+        closeSock();
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        continue;
+      }
+      lastHeartbeatAt = now;
+    }
+
+    if (!mapped) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(20));
+      continue;
+    }
+
+    uint8_t* mem = static_cast<uint8_t*>(mapped);
+    uint32_t* hdr = reinterpret_cast<uint32_t*>(mem);
+    if (hdr[0] != 0x304d4143) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(20));
+      continue;
+    }
+
+    uint32_t slotCount = std::min<uint32_t>(hdr[8], kAnkiCameraMaxFrames);
+    if (slotCount == 0) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(20));
+      continue;
+    }
+
+    int bestSlot = -1;
+    uint64_t bestTimestamp = 0;
+    uint32_t bestFrame = 0;
+
+    for (uint32_t slot = 0; slot < slotCount; ++slot) {
+      uint32_t unlocked = 0;
+      if (!__atomic_compare_exchange_n(&hdr[2 + slot], &unlocked, 1, false,
+                                       __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) {
+        continue;
+      }
+
+      uint32_t frameOffset = hdr[10 + slot];
+      if (frameOffset + sizeof(AnkiCameraFrame) <= mapLen) {
+        auto* frame = reinterpret_cast<AnkiCameraFrame*>(mem + frameOffset);
+        uint64_t timestamp = frame->timestamp;
+        if (timestamp != 0 && timestamp >= bestTimestamp) {
+          bestTimestamp = timestamp;
+          bestFrame = frame->frame_id;
+          bestSlot = static_cast<int>(slot);
+        }
+      }
+    }
+
+    for (uint32_t slot = 0; slot < slotCount; ++slot) {
+      if (static_cast<int>(slot) == bestSlot) continue;
+      uint32_t locked = 1;
+      __atomic_compare_exchange_n(&hdr[2 + slot], &locked, 0, false,
+                                  __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+    }
+
+    if (bestSlot < 0 || bestFrame == 0 || bestFrame == lastFrameNum) {
+      if (bestSlot >= 0) {
+        uint32_t locked = 1;
+        __atomic_compare_exchange_n(&hdr[2 + bestSlot], &locked, 0, false,
+                                    __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+      }
+      if (now - lastFrameAt > std::chrono::seconds(5)) {
+        printf("[Camera] No new camera frame for 5s, reconnecting client\n");
+        fflush(stdout);
+        closeSock();
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+      } else {
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+      }
+      continue;
+    }
+
+    lastFrameNum = bestFrame;
+    lastFrameAt = std::chrono::steady_clock::now();
+
+    uint32_t frameOffset = hdr[10 + bestSlot];
+    auto* cameraFrame = reinterpret_cast<AnkiCameraFrame*>(mem + frameOffset);
+    uint32_t pixelOffset = frameOffset + sizeof(AnkiCameraFrame);
+    int width = static_cast<int>(cameraFrame->width);
+    int height = static_cast<int>(cameraFrame->height);
+    int stride = static_cast<int>(cameraFrame->bytes_per_row);
+    uint8_t bpp = cameraFrame->bits_per_pixel;
+    uint8_t format = cameraFrame->format;
+
+    std::string bmp;
+    const size_t frameBytes = (width > 0 && height > 0 && stride > 0)
+      ? static_cast<size_t>(height) * static_cast<size_t>(stride)
+      : 0;
+    if (frameBytes > 0 && static_cast<size_t>(pixelOffset) + frameBytes <= mapLen) {
+      if (format == kAnkiCameraFormatRgb888 && bpp == 8) {
+        bmp = makeBmpFromRgb888(mem + pixelOffset, width, height, stride);
+        if (!bmp.empty()) {
+          unlockAllSlots(); // Fix: unlock format-switch slots so mm-anki-camera can continue producing frames!
+        }
+      } else if (!requestedRgb) {
+        lockAllSlots();
+        sendCameraFormatMessage(sock, kAnkiCameraFormatRgb888);
+        requestedRgb = true;
+      }
+      if (!bmp.empty()) {
+        {
+          std::lock_guard<std::mutex> lock(gCameraFrameMutex);
+          gLatestRawFrameBytes.assign(mem + pixelOffset, mem + pixelOffset + frameBytes);
+          gLatestRawFrameWidth = width;
+          gLatestRawFrameHeight = height;
+          gLatestRawFrameStride = stride;
+          gLatestRawFrameFormat = format;
+          gLatestRawFrameNum = bestFrame;
+          gLatestDefaultBmpBytes = bmp;
+          ++gLatestCameraSeq;
+        }
+        gCameraFrameCond.notify_all();
+        writeWholeFile(kCameraSnapshotPath, bmp, 0644);
+      }
+    }
+
+    uint32_t locked = 1;
+    __atomic_compare_exchange_n(&hdr[2 + bestSlot], &locked, 0, false,
+                                __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
   }
 
-  image = makeGrayscaleBmpFromRaw10(mem + rawOffset, width, height, stride);
-  munmap(mapped, mapLen);
-  close(sock);
-  unlink(localPath);
+  closeSock();
+}
 
-  if (image.empty()) {
-    error = "camera BMP encoding failed";
-    return false;
+void ensureCameraThreadStarted() {
+  bool expected = false;
+  if (gCameraThreadStarted.compare_exchange_strong(expected, true)) {
+    gCameraThread = std::thread(cameraThreadLoop);
   }
-  writeWholeFile(kCameraSnapshotPath, image, 0644);
-  return true;
 }
 
 // ── Motor position control ───────────────────────────────────────────────────
@@ -629,12 +1189,19 @@ struct MotorPosCmd {
   double  power;   // 0.0-1.0 magnitude
 };
 
+struct TrackDriveCmd {
+  int32_t ticks;    // positive = forward, negative = reverse
+  double  power;    // 0.0-1.0 magnitude
+  int     timeoutMs;
+};
+
 // Forward-declare gSpine so we can use it in the position thread.
 class Spine;
 extern Spine gSpine;  // defined below
 
 // Atomic flags per motor to cancel in-progress position commands.
 std::atomic<bool> gMotorPosCancel[4]{ {false}, {false}, {false}, {false} };
+std::atomic<bool> gTrackDriveCancel{false};
 
 bool setAudioVolumePercent(int percent) {
   percent = std::clamp(percent, 0, 100);
@@ -1483,11 +2050,22 @@ class Spine {
 Spine gSpine;
 Lcd gLcd;
 
+void stopMotorsHard(int repeats = 8) {
+  for (int i = 0; i < repeats; ++i) {
+    gSpine.setMotors(0, 0, 0, 0, 50);
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  }
+}
+
 struct MotorHoldState {
   bool enabled = false;
   int32_t target = 0;
   double maxPower = 0.65;
   int deadband = 6;
+  
+  // PID controller state
+  double integral = 0.0;
+  int32_t lastError = 0;
 };
 
 std::mutex gMotorHoldMutex;
@@ -1504,12 +2082,34 @@ void motorHoldLoop() {
     if (valid) {
       std::lock_guard<std::mutex> lock(gMotorHoldMutex);
       for (int m = 0; m < 4; ++m) {
-        const auto& hold = gMotorHold[m];
+        auto& hold = gMotorHold[m];
         if (!hold.enabled) continue;
         int32_t error = hold.target - snap.motor[m].position;
-        if (std::abs(error) <= hold.deadband) continue;
-        double p = std::clamp(std::abs(error) * 0.012, 0.18, hold.maxPower);
-        pw[m] = error > 0 ? p : -p;
+        if (std::abs(error) <= hold.deadband) {
+          hold.integral = 0.0;
+          hold.lastError = error;
+          continue;
+        }
+
+        // Accumulate integral with anti-windup clamping to prevent runaway
+        hold.integral += error;
+        hold.integral = std::clamp(hold.integral, -150.0, 150.0);
+
+        double derivative = error - hold.lastError;
+        hold.lastError = error;
+
+        // PID term calculation
+        double p_term = error * 0.015;
+        double i_term = hold.integral * 0.003;
+        double d_term = derivative * 0.005;
+
+        double p = p_term + i_term + d_term;
+        pw[m] = std::clamp(p, -hold.maxPower, hold.maxPower);
+
+        // Ensure minimum power threshold to overcome static friction / gravity stall
+        if (std::abs(pw[m]) < 0.18) {
+          pw[m] = pw[m] > 0 ? 0.18 : -0.18;
+        }
         active = true;
       }
     }
@@ -1579,8 +2179,44 @@ void motorPositionThread(MotorPosCmd cmd) {
     sendPower(pwr);
     std::this_thread::sleep_for(std::chrono::milliseconds(20));
   }
-  // Stop the motor
-  gSpine.setMotors(0, 0, 0, 0, 50);
+  stopMotorsHard();
+}
+
+void trackDriveThread(TrackDriveCmd cmd) {
+  gTrackDriveCancel.store(false);
+  gMotorPosCancel[0].store(true);
+  gMotorPosCancel[1].store(true);
+
+  bool valid = false;
+  BodyToHead start = gSpine.snapshot(&valid);
+  if (!valid) return;
+
+  const int32_t leftStart = start.motor[0].position;
+  const int32_t rightStart = start.motor[1].position;
+  const int32_t absTicks = std::abs(cmd.ticks);
+  const bool forward = cmd.ticks >= 0;
+  const int32_t leftTarget = leftStart + (forward ? absTicks : -absTicks);
+  const int32_t rightTarget = rightStart + (forward ? -absTicks : absTicks);
+  const double power = std::abs(cmd.power) * (forward ? 1.0 : -1.0);
+  const auto deadline = std::chrono::steady_clock::now() +
+                        std::chrono::milliseconds(std::clamp(cmd.timeoutMs, 250, kMotorPositionTtlMs));
+
+  while (!gTrackDriveCancel.load() && std::chrono::steady_clock::now() < deadline) {
+    BodyToHead snap = gSpine.snapshot(&valid);
+    if (!valid) break;
+
+    const int32_t leftPos = snap.motor[0].position;
+    const int32_t rightPos = snap.motor[1].position;
+    const bool leftDone = forward ? (leftPos >= leftTarget) : (leftPos <= leftTarget);
+    const bool rightDone = forward ? (rightPos <= rightTarget) : (rightPos >= rightTarget);
+    if (leftDone && rightDone) break;
+
+    gSpine.setMotors(leftDone ? 0.0 : power, rightDone ? 0.0 : power, 0, 0, 160);
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  }
+
+  stopMotorsHard();
+  gTrackDriveCancel.store(false);
 }
 
 std::string bodyJson() {
@@ -1808,6 +2444,15 @@ void sseEvents(int fd) {
   }
 }
 
+std::string getQueryParam(const std::string& query, const std::string& key) {
+  size_t pos = query.find(key + "=");
+  if (pos == std::string::npos) return "";
+  pos += key.size() + 1;
+  size_t end = query.find('&', pos);
+  if (end == std::string::npos) return query.substr(pos);
+  return query.substr(pos, end - pos);
+}
+
 void handleClient(int fd) {
   std::string req;
   char buf[4096];
@@ -1827,6 +2472,12 @@ void handleClient(int fd) {
   std::istringstream first(req.substr(0, req.find("\r\n")));
   std::string method, path, version;
   first >> method >> path >> version;
+  size_t qPos = path.find('?');
+  std::string query;
+  if (qPos != std::string::npos) {
+    query = path.substr(qPos + 1);
+    path = path.substr(0, qPos);
+  }
   size_t contentLength = 0;
   std::string cl = headerValue(req, "Content-Length");
   if (!cl.empty()) contentLength = static_cast<size_t>(strtoul(cl.c_str(), nullptr, 10));
@@ -1860,6 +2511,7 @@ void handleClient(int fd) {
     {"method":"GET","path":"/v1/motors/state","desc":"Current encoder state for all 4 motors. Returns motors array with id (0=left_track, 1=right_track, 2=lift, 3=head), position (int32 ticks), delta (ticks since last frame), time."},
     {"method":"POST","path":"/v1/motors","desc":"Set raw motor power. Body: {left, right, lift, head: -1.0..1.0, ttl_ms: int}. Motors auto-stop when ttl_ms expires."},
     {"method":"POST","path":"/v1/motors/position","desc":"Move a motor by a relative number of encoder ticks. Body: {motor: 0-3, ticks: int (signed), power: 0.0-1.0}. Returns immediately; motor runs in background and stops when ticks accumulated or 10s TTL expires."},
+    {"method":"POST","path":"/v1/motors/drive","desc":"Synchronously start both track motors for a relative straight drive. Body: {ticks: int (positive forward, negative reverse), power?:0.01..1.0, timeout_ms?:250..10000}. Returns immediately; background controller stops each track at its encoder target and sends repeated zero-power stop frames."},
     {"method":"POST","path":"/v1/motors/hold","desc":"Enable or disable closed-loop encoder hold. Enable body: {motor:0-3, enabled:1, target?:ticks, power?:0.2..1.0, deadband?:ticks}. Disable body: {motor:0-3, enabled:0}."},
     {"method":"POST","path":"/v1/motors/stop","desc":"Cancel any in-progress position commands and zero all motors. No body needed."},
     {"method":"POST","path":"/v1/leds/backpack","desc":"Set backpack LED color. Body: array of up to 4 objects [{r,g,b}] each 0-255."},
@@ -1896,7 +2548,7 @@ void handleClient(int fd) {
     "Motor 2 (lift): positive power = up.",
     "Motor 3 (head): positive power = up/forward tilt.",
     "Encoder ticks accumulate indefinitely; use delta for velocity detection.",
-    "Camera snapshot file is /tmp/vector-camera-snapshot.bmp; generated from Anki RAW10 shared-memory frames.",
+    "Camera snapshot file is /tmp/vector-camera-snapshot.bmp; generated from Anki RGB888 shared-memory frames.",
     "Cliff sensors cliff[0-3] < 90 indicates cliff/air detected.",
     "Touch sensor touch[0] > 610 indicates touch active; touch[1] not populated.",
     "Proximity range_mm 8190/8191 = out of range sentinel."
@@ -1928,6 +2580,7 @@ void handleClient(int fd) {
     sendResponse(fd, 200, "OK", out.str());
   } else if (method == "POST" && path == "/v1/motors") {
     disableAllMotorHolds();
+    gTrackDriveCancel.store(true);
     int ttl = static_cast<int>(numberField(body, "ttl_ms", kDefaultTtlMs));
     gSpine.setMotors(numberField(body, "left", 0), numberField(body, "right", 0),
                      numberField(body, "lift", 0), numberField(body, "head", 0), ttl);
@@ -1942,6 +2595,7 @@ void handleClient(int fd) {
       sendJsonError(fd, 400, "ticks must be non-zero");
     } else {
       disableMotorHold(motor);
+      if (motor == 0 || motor == 1) gTrackDriveCancel.store(true);
       // Cancel any existing position command for this motor
       gMotorPosCancel[motor].store(true);
       std::this_thread::sleep_for(std::chrono::milliseconds(25));
@@ -1954,6 +2608,29 @@ void handleClient(int fd) {
           << ",\"power\":" << pwr << "}";
       sendResponse(fd, 200, "OK", out.str());
     }
+  } else if (method == "POST" && path == "/v1/motors/drive") {
+    int32_t ticks = static_cast<int32_t>(numberField(body, "ticks", 0));
+    double pwr = std::clamp(std::abs(numberField(body, "power", 0.35)), 0.01, 1.0);
+    int timeoutMs = std::clamp(static_cast<int>(numberField(body, "timeout_ms", kMotorPositionTtlMs)),
+                               250, kMotorPositionTtlMs);
+    if (ticks == 0) {
+      sendJsonError(fd, 400, "ticks must be non-zero");
+    } else {
+      disableMotorHold(0);
+      disableMotorHold(1);
+      gMotorPosCancel[0].store(true);
+      gMotorPosCancel[1].store(true);
+      gTrackDriveCancel.store(true);
+      std::this_thread::sleep_for(std::chrono::milliseconds(25));
+      gTrackDriveCancel.store(false);
+      TrackDriveCmd cmd{ticks, pwr, timeoutMs};
+      std::thread(trackDriveThread, cmd).detach();
+      std::ostringstream out;
+      out << "{\"ok\":true,\"ticks\":" << ticks
+          << ",\"power\":" << pwr
+          << ",\"timeout_ms\":" << timeoutMs << "}";
+      sendResponse(fd, 200, "OK", out.str());
+    }
   } else if (method == "POST" && path == "/v1/motors/hold") {
     int motor = static_cast<int>(numberField(body, "motor", -1));
     bool enabled = numberField(body, "enabled", 1) != 0;
@@ -1962,7 +2639,8 @@ void handleClient(int fd) {
     } else if (!enabled) {
       disableMotorHold(motor);
       gMotorPosCancel[motor].store(true);
-      gSpine.setMotors(0, 0, 0, 0, 50);
+      if (motor == 0 || motor == 1) gTrackDriveCancel.store(true);
+      stopMotorsHard();
       sendResponse(fd, 200, "OK", "{\"ok\":true,\"enabled\":false}");
     } else {
       bool valid = false;
@@ -1980,6 +2658,8 @@ void handleClient(int fd) {
           gMotorHold[motor].target = target;
           gMotorHold[motor].maxPower = maxPower;
           gMotorHold[motor].deadband = deadband;
+          gMotorHold[motor].integral = 0.0;
+          gMotorHold[motor].lastError = 0;
         }
         ensureMotorHoldLoop();
         std::ostringstream out;
@@ -1993,7 +2673,8 @@ void handleClient(int fd) {
   } else if (method == "POST" && path == "/v1/motors/stop") {
     disableAllMotorHolds();
     for (int i = 0; i < 4; ++i) gMotorPosCancel[i].store(true);
-    gSpine.setMotors(0, 0, 0, 0, 50);
+    gTrackDriveCancel.store(true);
+    stopMotorsHard();
     sendResponse(fd, 200, "OK", "{\"ok\":true}");
   } else if (method == "POST" && path == "/v1/leds/backpack") {
     auto rgb = parseBackpackRgb(body);
@@ -2016,22 +2697,32 @@ void handleClient(int fd) {
       sendJsonError(fd, 503, gLcd.lastError().empty() ? "display frame failed" : gLcd.lastError());
     }
   } else if (method == "GET" && path == "/v1/camera/snapshot") {
-    std::string image = readFile(kCameraSnapshotPath, 8 * 1024 * 1024);
-    long ageMs = 0;
-    if (image.empty() || !cameraSnapshotAge(ageMs) || ageMs > 400) {
-      std::string error;
-      image.clear();
-      captureCameraSnapshotBmp(image, error);
-      if (image.empty()) {
-        sendJsonError(fd, 503, error.empty() ? "camera snapshot unavailable" : error);
-      } else {
-        sendResponse(fd, 200, "OK", image, "image/bmp");
-      }
+    gCameraEnabled.store(true);
+    ensureCameraThreadStarted();
+    uint64_t startSeq = 0;
+    {
+      std::lock_guard<std::mutex> lock(gCameraFrameMutex);
+      startSeq = gLatestCameraSeq;
+    }
+    {
+      std::unique_lock<std::mutex> lock(gCameraFrameMutex);
+      gCameraFrameCond.wait_for(lock, std::chrono::milliseconds(2500), [&] {
+        return gLatestCameraSeq > startSeq || (startSeq == 0 && !gLatestDefaultBmpBytes.empty());
+      });
+    }
+    std::string image;
+    std::lock_guard<std::mutex> lock(gCameraFrameMutex);
+    image = gLatestDefaultBmpBytes;
+
+    if (image.empty()) {
+      sendJsonError(fd, 503, "camera snapshot warming up");
     } else {
       sendResponse(fd, 200, "OK", image, "image/bmp");
     }
   } else if (method == "GET" && path == "/v1/camera/stream") {
-    // Multipart BMP stream — keep connection open and push updated frames.
+    gCameraEnabled.store(true);
+    ensureCameraThreadStarted();
+
     {
       std::ostringstream hdr;
       hdr << "HTTP/1.1 200 OK\r\n";
@@ -2040,24 +2731,29 @@ void handleClient(int fd) {
       hdr << "Connection: close\r\n\r\n";
       if (!sendAll(fd, hdr.str())) { close(fd); return; }
     }
-    struct stat lastStat{};
+
+    uint64_t lastSentSeq = 0;
     while (gRunning) {
-      struct stat st;
-      if (stat(kCameraSnapshotPath, &st) != 0) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(200));
-        continue;
+      if (!gCameraEnabled.load()) break;
+      std::string image;
+      {
+        std::unique_lock<std::mutex> lock(gCameraFrameMutex);
+        gCameraFrameCond.wait_for(lock, std::chrono::milliseconds(1500), [&] {
+          return gLatestCameraSeq > lastSentSeq || !gCameraEnabled.load() || !gRunning;
+        });
+        if (!gCameraEnabled.load() || !gRunning) break;
+        if (gLatestCameraSeq <= lastSentSeq) continue;
       }
-      // Only push when the file has been updated
-      if (st.st_mtime == lastStat.st_mtime && st.st_size == lastStat.st_size) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(kCameraStreamMs));
-        continue;
-      }
-      lastStat = st;
-      std::string image = readFile(kCameraSnapshotPath, 8 * 1024 * 1024);
+
+      std::lock_guard<std::mutex> lock(gCameraFrameMutex);
+      image = gLatestDefaultBmpBytes;
+      lastSentSeq = gLatestCameraSeq;
+
       if (image.empty()) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(kCameraStreamMs));
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
         continue;
       }
+
       std::ostringstream part;
       part << "--frame\r\n";
       part << "Content-Type: image/bmp\r\n";
@@ -2069,17 +2765,14 @@ void handleClient(int fd) {
     close(fd);
     return;
   } else if (method == "POST" && path == "/v1/camera/daemon/start") {
-    std::string error;
-    if (startCameraDaemon(error)) {
-      std::ostringstream out;
-      out << "{\"ok\":true,\"pid\":" << gCameraDaemonPid.load() << "}";
-      sendResponse(fd, 200, "OK", out.str());
-    } else {
-      sendJsonError(fd, 500, error);
-    }
+    gCameraEnabled.store(true);
+    ensureCameraThreadStarted();
+    std::ostringstream out;
+    out << "{\"ok\":true}";
+    sendResponse(fd, 200, "OK", out.str());
   } else if (method == "POST" && path == "/v1/camera/daemon/stop") {
+    gCameraEnabled.store(false);
     stopCameraDaemon();
-    gCameraDaemonPid.store(-1);
     sendResponse(fd, 200, "OK", "{\"ok\":true}");
   } else if (method == "GET" && path == "/v1/audio/status") {
     sendResponse(fd, 200, "OK", "{\"available\":" + std::string((exists("/usr/bin/aplay") || exists("/bin/aplay")) ? "true" : "false") +
@@ -2168,11 +2861,13 @@ int main(int argc, char** argv) {
   signal(SIGTERM, handleSignal);
   signal(SIGPIPE, SIG_IGN);
 
+  joinSupplementaryGroupIfPresent("camera");
+
   gSpine.start();
   gImu.init();
 
   int port = parsePort(argc, argv);
-  int srv = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+  int srv = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
   if (srv < 0) {
     perror("socket");
     return 1;
@@ -2194,12 +2889,18 @@ int main(int argc, char** argv) {
     return 1;
   }
 
+  ensureCameraThreadStarted();
+
   while (gRunning) {
     sockaddr_in peer{};
     socklen_t peerLen = sizeof(peer);
     int fd = accept4(srv, reinterpret_cast<sockaddr*>(&peer), &peerLen, SOCK_CLOEXEC);
     if (fd < 0) {
       if (errno == EINTR) continue;
+      if (errno == EAGAIN || errno == EWOULDBLOCK) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        continue;
+      }
       std::this_thread::sleep_for(std::chrono::milliseconds(50));
       continue;
     }
@@ -2209,5 +2910,6 @@ int main(int argc, char** argv) {
   close(srv);
   gImu.stop();
   gSpine.stop();
+  if (gCameraThread.joinable()) gCameraThread.join();
   return 0;
 }

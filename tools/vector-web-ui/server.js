@@ -9,6 +9,11 @@ const PUBLIC_DIR = join(import.meta.dir, "public");
 // target  = what the browser requested
 // current = what we're actually sending (ramped toward target)
 let robotIp = Bun.env.VECTOR_ROBOT_IP || "192.168.1.89";
+let robotPort = Number(Bun.env.VECTOR_ROBOT_PORT || 8080);
+
+function robotUrl(path, ip = robotIp, port = robotPort) {
+  return `http://${ip}:${port}${path}`;
+}
 
 function getLocalIpForRobot(robotIp) {
   const nets = networkInterfaces();
@@ -130,7 +135,7 @@ function stopUdpAudio() {
 setInterval(async () => {
   if (wsClients.size === 0) return;
   try {
-    const res = await fetch(`http://${robotIp}:8080/v1/status`);
+    const res = await fetch(robotUrl("/v1/status"));
     if (res.ok) {
       const data = await res.json();
       if (data.imu) {
@@ -147,7 +152,7 @@ setInterval(async () => {
 setInterval(async () => {
   if (wsClients.size === 0) return;
   try {
-    const res = await fetch(`http://${robotIp}:8080/v1/motors/state`);
+    const res = await fetch(robotUrl("/v1/motors/state"));
     if (res.ok) {
       const data = await res.json();
       const msg = JSON.stringify({ type: "motor_state", data });
@@ -195,7 +200,7 @@ setInterval(async () => {
 
   try {
     const { left, right, lift, head } = current;
-    await fetch(`http://${robotIp}:8080/v1/motors`, {
+    await fetch(robotUrl("/v1/motors"), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ left, right, lift, head, ttl_ms: 350 }),
@@ -211,7 +216,7 @@ let telemetryAbort = new AbortController();
 async function runTelemetryRelay() {
   while (true) {
     try {
-      const res = await fetch(`http://${robotIp}:8080/v1/events`, {
+      const res = await fetch(robotUrl("/v1/events"), {
         signal: telemetryAbort.signal,
       });
       if (!res.body) { await sleep(1000); continue; }
@@ -275,7 +280,7 @@ const server = Bun.serve({
 
     if (url.pathname === "/favicon.ico") return new Response(null, { status: 204 });
 
-    if (url.pathname === "/api/camera/stream") return cameraMjpegProxy(req);
+    if (url.pathname === "/api/camera/stream") return cameraStreamProxy(req, url);
 
     if (url.pathname.startsWith("/api/")) return apiProxy(req, url);
 
@@ -285,7 +290,7 @@ const server = Bun.serve({
   websocket: {
     open(ws) {
       wsClients.add(ws);
-      ws.send(JSON.stringify({ type: "config", ip: robotIp }));
+      ws.send(JSON.stringify({ type: "config", ip: robotIp, port: robotPort }));
       console.log(`[WS] +client  total=${wsClients.size}`);
     },
 
@@ -335,6 +340,10 @@ const server = Bun.serve({
             // Restart telemetry relay with new IP
             telemetryAbort.abort();
           }
+          if (msg.port && Number(msg.port) !== robotPort) {
+            robotPort = Number(msg.port);
+            telemetryAbort.abort();
+          }
           break;
 
         case "mic_start": {
@@ -371,7 +380,7 @@ const server = Bun.serve({
 const clamp = v => Math.max(-1, Math.min(1, v));
 
 function robotPost(path, body) {
-  fetch(`http://${robotIp}:8080${path}`, {
+  fetch(robotUrl(path), {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
@@ -380,18 +389,20 @@ function robotPost(path, body) {
 
 async function apiProxy(req, url) {
   const ip = req.headers.get("x-robot-ip") || robotIp;
-  const target = `http://${ip}:8080${url.pathname.replace("/api/", "/v1/")}`;
+  const port = Number(req.headers.get("x-robot-port") || robotPort);
+  const target = robotUrl(`${url.pathname.replace("/api/", "/v1/")}${url.search}`, ip, port);
   if (req.method === "OPTIONS") {
     return new Response(null, { headers: {
       "Access-Control-Allow-Origin": "*",
       "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
-      "Access-Control-Allow-Headers": "Content-Type, x-robot-ip",
+      "Access-Control-Allow-Headers": "Content-Type, x-robot-ip, x-robot-port",
     }});
   }
   try {
     const h = new Headers(req.headers);
     h.delete("host");
     h.delete("x-robot-ip");
+    h.delete("x-robot-port");
     h.delete("content-length");
     h.delete("transfer-encoding");
     const opts = { method: req.method, headers: h };
@@ -412,12 +423,13 @@ async function apiProxy(req, url) {
   }
 }
 
-// ── Camera MJPEG stream proxy ─────────────────────────────────────────────────
-// Pass-through: connects to robot MJPEG and streams bytes directly to browser.
-async function cameraMjpegProxy(req) {
+// ── Camera multipart stream proxy ─────────────────────────────────────────────
+// Pass-through: connects to robot camera stream and forwards multipart frames.
+async function cameraStreamProxy(req, url) {
   const ip = req.headers.get("x-robot-ip") || robotIp;
+  const port = Number(req.headers.get("x-robot-port") || robotPort);
   try {
-    const upstream = await fetch(`http://${ip}:8080/v1/camera/stream`, {
+    const upstream = await fetch(robotUrl(`/v1/camera/stream${url.search}`, ip, port), {
       headers: { Accept: "multipart/x-mixed-replace" },
     });
     if (!upstream.ok || !upstream.body) {
@@ -456,4 +468,4 @@ async function serveFile(pathname) {
 }
 
 console.log(`\n🤖  Vector Web UI  →  http://localhost:${PORT}\n`);
-console.log(`Default robot IP: ${robotIp}`);
+console.log(`Default robot API: ${robotIp}:${robotPort}`);

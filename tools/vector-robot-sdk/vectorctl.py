@@ -28,6 +28,10 @@ def main() -> int:
     move.add_argument("motor", type=int, choices=range(4))
     move.add_argument("ticks", type=int)
     move.add_argument("--power", type=float, default=0.5)
+    drive = sub.add_parser("drive")
+    drive.add_argument("ticks", type=int)
+    drive.add_argument("--power", type=float, default=0.35)
+    drive.add_argument("--timeout-ms", type=int, default=10000)
 
     hold = sub.add_parser("hold")
     hold.add_argument("motor", type=int, choices=range(4))
@@ -66,6 +70,8 @@ def main() -> int:
         print_json(robot.motors_state())
     elif args.cmd == "move":
         print_json(robot.move_motor(args.motor, args.ticks, args.power))
+    elif args.cmd == "drive":
+        print_json(robot.drive_straight(args.ticks, args.power, args.timeout_ms))
     elif args.cmd == "hold":
         print_json(robot.hold_motor(args.motor, True, args.target, args.power, args.deadband))
     elif args.cmd == "release":
@@ -85,4 +91,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

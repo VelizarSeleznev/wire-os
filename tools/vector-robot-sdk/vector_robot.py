@@ -77,6 +77,13 @@ class VectorRobot:
     def move_motor(self, motor: int, ticks: int, power: float = 0.5) -> dict[str, Any]:
         return self.request("POST", "/v1/motors/position", {"motor": motor, "ticks": ticks, "power": power})
 
+    def drive_straight(self, ticks: int, power: float = 0.35, timeout_ms: int = 10000) -> dict[str, Any]:
+        return self.request("POST", "/v1/motors/drive", {
+            "ticks": ticks,
+            "power": power,
+            "timeout_ms": timeout_ms,
+        })
+
     def hold_motor(self, motor: int, enabled: bool = True, target: int | None = None, power: float = 0.7, deadband: int = 6) -> dict[str, Any]:
         body: dict[str, Any] = {"motor": motor, "enabled": 1 if enabled else 0}
         if enabled:
@@ -101,4 +108,3 @@ class VectorRobot:
         if out is not None:
             Path(out).write_bytes(image)
         return image
-

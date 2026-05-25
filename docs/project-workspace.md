@@ -68,6 +68,9 @@ Local LLM/client tooling for the robot HTTP API:
 - `vectorctl.py`: CLI for status, sensors, motors, hold, LEDs, and snapshots.
 - `vector_mcp.py`: minimal stdio MCP-compatible tool server for LLM clients.
 
+See `docs/vector-mcp.md` for the MCP tool contract, including the motor map
+exposed to models: `0=left_track`, `1=right_track`, `2=lift`, `3=head`.
+
 ## Current Verified State
 
 On 2026-05-22, `machine-hw-image` built successfully:

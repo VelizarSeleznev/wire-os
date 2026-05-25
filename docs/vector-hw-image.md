@@ -324,21 +324,31 @@ sequence before it should be treated as production display support.
 
 Camera snapshot now captures from the original `mm-anki-camera` Unix datagram
 socket/shared-memory path and serves `/tmp/vector-camera-snapshot.bmp` as a
-640x360 grayscale BMP generated from RAW10 frames. The current output is usable
-for validation snapshots but still needs a proper color/demosaic pipeline.
+640x360 24-bit BMP generated from RGB888 frames. The API sends the full
+register/start/params/heartbeat protocol, requests `RGB888`, locks and releases
+`CAM0` shared-memory slots, locks all old slots before a format change and
+unlocks them when the replacement RGB buffer arrives, and no longer depends on
+the obsolete RAW10/Bayer grayscale decode or restart-on-stall loop.
 
 Additional hardware notes:
 
 - Motor encoder telemetry is present in Spine frames and exposed as
   `motor[].position`, `motor[].delta`, and `motor[].time`. `POST
-  /v1/motors/position` handles relative encoder moves, and `POST
-  /v1/motors/hold` now runs a robot-side closed-loop hold for one motor.
+  /v1/motors/position` handles relative encoder moves, `POST /v1/motors/drive`
+  handles synchronized straight track moves, and `POST /v1/motors/hold` now
+  runs a robot-side closed-loop hold for one motor.
 - Motion sensors/IMU are still suspect on the observed robot: the SPI path
   returns a stable WHO_AM_I but accel/gyro values remain effectively constant.
 - The image contains `mm-camera`, `mm-qcamera-daemon`, and `mm-anki-camera`
-  binaries. The API now starts `mm-qcamera-daemon` and
-  `mm-anki-camera-wrapper -C`, then reads the Anki shared-memory frame buffer.
-  The stock `mm-anki-camera.service` still fails because the minimal image does
-  not create the `camera` group expected by that service.
+  binaries. The API starts or adopts `mm-qcamera-daemon`, starts
+  `mm-anki-camera-wrapper -v 0 -r 1`, then owns the original Anki camera client
+  protocol over `/var/run/mm-anki-camera/camera-server`: full-size
+  register/start/params/heartbeat messages, SCM_RIGHTS fd passing, `CAM0`
+  shared-memory slot locks, slot release after copy, and the stock
+  format-change barrier that locks old slots before requesting `RGB888`. It
+  serves 640x360 24-bit BMP snapshots/stream frames. The older RAW10/Bayer
+  grayscale decode path and restart-on-stall workaround should be treated as
+  obsolete. On stock-like systems the socket belongs to group `camera`, so the
+  API joins that supplementary group when present.
 - Proximity/TOF and the second touch sensor are not proven working on the
   observed robot; treat their raw telemetry as diagnostic until validated.

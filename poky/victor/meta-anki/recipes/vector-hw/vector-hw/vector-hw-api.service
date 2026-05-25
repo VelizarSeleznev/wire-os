@@ -5,7 +5,7 @@ Wants=connman.service network.target
 
 [Service]
 Type=simple
-ExecStartPre=/bin/sh -c '/usr/sbin/export-gpio 94 && /usr/sbin/export-gpio 0 && sleep 0.1 && echo 0 > /sys/class/gpio/gpio94/value && echo 1 > /sys/class/gpio/gpio0/value && sleep 0.1 && echo 1 > /sys/class/gpio/gpio94/value'
+ExecStartPre=/bin/sh -c '/usr/sbin/export-gpio 94 || true; /usr/sbin/export-gpio 0 || true; sleep 0.1; echo 0 > /sys/class/gpio/gpio94/value || true; echo 1 > /sys/class/gpio/gpio0/value || true; sleep 0.1; echo 1 > /sys/class/gpio/gpio94/value || true'
 ExecStart=/usr/bin/vector-hw-api --listen 0.0.0.0:8080
 ExecStopPost=/usr/bin/vector-hw-api --stop-motors
 Restart=on-failure

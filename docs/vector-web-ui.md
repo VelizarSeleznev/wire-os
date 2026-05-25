@@ -123,15 +123,26 @@ Result:
   OK and moved the encoder. `HOLD` now calls robot-side `/v1/motors/hold`
   instead of browser polling relative correction moves.
 - Camera controls now display robot-produced BMP snapshots from
-  `/v1/camera/snapshot`. The current frame is grayscale RAW10-derived output
-  with visible Bayer/stripe artifacts, but it is a real camera image.
+  `/v1/camera/snapshot`. The default frame is now a 640x360 24-bit color BMP
+  generated from Anki RGB888 shared-memory frames.
+- The Bun proxy accepts `VECTOR_ROBOT_PORT` in addition to `VECTOR_ROBOT_IP`,
+  which allows local validation against temporary API runs such as port `8081`
+  without changing the browser code.
 
 Robot validation on `192.168.1.89` after the firmware hot-patch:
 
 - `/v1/display/init` returned OK with `panel=santek`.
 - `/v1/display/frame` accepted a generated RGB565 test pattern.
 - `/v1/audio/play` accepted a generated WAV and `aplay` reported playback.
-- `/v1/camera/snapshot` returned `image/bmp` with a 640x360 visible room frame.
+- `/v1/camera/snapshot` returned `image/bmp` with a 640x360 visible color room
+  frame during temporary 2026-05-25 validation on stock-like OS port 8081.
+- `/v1/camera/stream` stayed connected and returned multipart BMP frames. After
+  the RGB888 protocol rewrite and format-change slot-lock barrier, a 12s
+  client-timeout run returned 58 fresh multipart parts during temporary
+  2026-05-25 validation.
+- Chrome displayed the proxied camera stream in the web UI as a canvas-rendered
+  live feed. Playwright validation drew 38 `640x360` canvas frames in 8s,
+  reported `LIVE`, and had no console warnings/errors.
 - `/v1/motors/hold` enabled and disabled lift hold successfully via API.
 
 ## Known Issues
@@ -145,9 +156,13 @@ The UI is not production-grade yet.
   wrong for another robot or firmware revision.
 - The UI assumes `/v1/events` can be consumed as SSE through the proxy.
 - It does not yet expose app install/start/stop/delete endpoints.
-- Camera snapshot display currently receives BMP frames, not JPEG. The image is
-  usable for validation but still needs color/demosaic cleanup in firmware.
-- No automated browser test exists yet.
+- Camera stream display currently receives multipart BMP frames, not JPEG. The
+  browser UI parses the multipart stream and draws BMP frames onto a canvas,
+  using native `createImageBitmap(image/bmp)` when available and a manual 24-bit
+  BMP decoder as fallback.
+  This differs from wire-pod's stock-runtime path, which decodes robot
+  `ImageChunk` data server-side and re-encodes multipart JPEG for the browser.
+  The default firmware output is now RGB888-derived color.
 
 The display controls resize still images or video frames to the robot face
 canvas (`184x96`), convert pixels to little-endian RGB565, and POST the exact

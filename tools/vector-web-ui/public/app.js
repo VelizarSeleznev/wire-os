@@ -966,14 +966,10 @@ D.audioStop.addEventListener("click", async () => {
   setAudioStatus("STOPPED");
 });
 
-// ── Camera panel UI (snapshot-polling mode) ───────────────────────────────────
-// We do NOT use MJPEG <img> because the Bun proxy can stall when the robot
-// is slow. Instead we poll /api/camera/snapshot every 500ms and display
-// as a dataURL — this gives reliable ~2fps even with a cold daemon.
 let camStreamActive = false;
-let camStreamTimer  = null;
-let camImgEl        = null;
-let camLastUrl      = null;
+let camStreamAbort  = null;
+let camCanvasEl     = null;
+let camCtx          = null;
 let camFrameCount   = 0;
 let camFpsClock     = Date.now();
 
@@ -984,66 +980,173 @@ function setCamStreamStatus(text, cls = "") {
   if (D.vcamStream) { D.vcamStream.textContent = text; D.vcamStream.className = "val " + cls; }
 }
 
-function camEnsureImg() {
-  if (!camImgEl) {
-    camImgEl = document.createElement("img");
-    camImgEl.alt = "Camera";
-    camImgEl.style.cssText = "width:100%;height:100%;object-fit:contain;display:block";
-    if (D.camFeedWrap) D.camFeedWrap.appendChild(camImgEl);
+function camEnsureCanvas(width = 320, height = 180) {
+  if (!camCanvasEl) {
+    camCanvasEl = document.createElement("canvas");
+    camCanvasEl.width = width;
+    camCanvasEl.height = height;
+    camCanvasEl.style.cssText = "width:100%;height:100%;object-fit:contain;display:block";
+    camCtx = camCanvasEl.getContext("2d", { alpha: false });
+    if (D.camFeedWrap) D.camFeedWrap.appendChild(camCanvasEl);
+  } else if (camCanvasEl.width !== width || camCanvasEl.height !== height) {
+    camCanvasEl.width = width;
+    camCanvasEl.height = height;
   }
   if (D.camOffline) D.camOffline.style.display = "none";
 }
 
-async function camPollFrame() {
-  if (!camStreamActive) return;
-  try {
-    const resp = await robotFetch("/camera/snapshot", {}, { noThrow: true });
-    if (resp && resp.ok) {
-      const blob = await resp.blob();
-      const url  = URL.createObjectURL(blob);
-      camEnsureImg();
-      camImgEl.src = url;
-      // Revoke previous URL to free memory
-      if (camLastUrl) setTimeout(() => URL.revokeObjectURL(camLastUrl), 2000);
-      camLastUrl = url;
-      // FPS counter
-      camFrameCount++;
-      const now = Date.now();
-      if (now - camFpsClock >= 2000) {
-        const fps = (camFrameCount / ((now - camFpsClock) / 1000)).toFixed(1);
-        if (D.vcamFps) D.vcamFps.textContent = fps;
-        camFrameCount = 0;
-        camFpsClock = now;
-      }
-      setCamStreamStatus("LIVE", "ok");
-    } else {
-      setCamStreamStatus("NO FRAME", "bad");
-    }
-  } catch (e) {
-    setCamStreamStatus("ERROR", "bad");
+function camDrawBmpFallback(bytes) {
+  if (bytes.length < 54 || bytes[0] !== 0x42 || bytes[1] !== 0x4d) {
+    throw new Error("invalid BMP frame");
   }
-  if (camStreamActive) camStreamTimer = setTimeout(camPollFrame, 500);
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const offset = view.getUint32(10, true);
+  const width = view.getInt32(18, true);
+  const signedHeight = view.getInt32(22, true);
+  const height = Math.abs(signedHeight);
+  const bpp = view.getUint16(28, true);
+  if (width <= 0 || height <= 0 || bpp !== 24) throw new Error("unsupported BMP frame");
+
+  const rowBytes = Math.floor((width * 3 + 3) / 4) * 4;
+  camEnsureCanvas(width, height);
+  const image = camCtx.createImageData(width, height);
+  const topDown = signedHeight < 0;
+  for (let y = 0; y < height; y++) {
+    const srcY = topDown ? y : height - 1 - y;
+    const srcRow = offset + srcY * rowBytes;
+    let dst = y * width * 4;
+    for (let x = 0; x < width; x++) {
+      const src = srcRow + x * 3;
+      image.data[dst++] = bytes[src + 2];
+      image.data[dst++] = bytes[src + 1];
+      image.data[dst++] = bytes[src + 0];
+      image.data[dst++] = 255;
+    }
+  }
+  camCtx.putImageData(image, 0, 0);
+}
+
+async function camDrawBmp(bytes) {
+  if (bytes.length < 54 || bytes[0] !== 0x42 || bytes[1] !== 0x4d) {
+    throw new Error("invalid BMP frame");
+  }
+
+  if ("createImageBitmap" in window) {
+    try {
+      const blob = new Blob([bytes], { type: "image/bmp" });
+      const bitmap = await createImageBitmap(blob);
+      camEnsureCanvas(bitmap.width, bitmap.height);
+      camCtx.drawImage(bitmap, 0, 0);
+      bitmap.close();
+      return;
+    } catch (_) {
+      // Fall through to the manual decoder for browsers without BMP support.
+    }
+  }
+
+  camDrawBmpFallback(bytes);
+}
+
+function camNoteFrame() {
+  camFrameCount++;
+  const now = Date.now();
+  if (now - camFpsClock >= 2000) {
+    const fps = (camFrameCount / ((now - camFpsClock) / 1000)).toFixed(1);
+    if (D.vcamFps) D.vcamFps.textContent = fps;
+    camFrameCount = 0;
+    camFpsClock = now;
+  }
+  setCamStreamStatus("LIVE", "ok");
+}
+
+function findBytes(haystack, needle, from = 0) {
+  outer: for (let i = from; i <= haystack.length - needle.length; i++) {
+    for (let j = 0; j < needle.length; j++) {
+      if (haystack[i + j] !== needle[j]) continue outer;
+    }
+    return i;
+  }
+  return -1;
+}
+
+function concatBytes(a, b) {
+  const out = new Uint8Array(a.length + b.length);
+  out.set(a, 0);
+  out.set(b, a.length);
+  return out;
+}
+
+async function camReadMultipartStream(resp) {
+  const reader = resp.body.getReader();
+  const boundary = new TextEncoder().encode("--frame");
+  let pending = new Uint8Array(0);
+
+  while (camStreamActive) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    pending = concatBytes(pending, value);
+
+    while (true) {
+      const first = findBytes(pending, boundary);
+      if (first < 0) {
+        if (pending.length > 1024 * 1024) pending = pending.slice(-1024);
+        break;
+      }
+      const second = findBytes(pending, boundary, first + boundary.length);
+      if (second < 0) {
+        if (first > 0) pending = pending.slice(first);
+        break;
+      }
+
+      const part = pending.slice(first + boundary.length, second);
+      pending = pending.slice(second);
+      const bmpStart = findBytes(part, new Uint8Array([0x42, 0x4d]));
+      if (bmpStart >= 0) {
+        await camDrawBmp(part.slice(bmpStart));
+        camNoteFrame();
+      }
+    }
+  }
+}
+
+async function camStreamLoop(signal) {
+  try {
+    const resp = await robotFetch("/camera/stream", {
+      cache: "no-store",
+      signal,
+      headers: { Accept: "multipart/x-mixed-replace" },
+    });
+    if (!resp.ok || !resp.body) throw new Error(await resp.text());
+    await camReadMultipartStream(resp);
+    if (camStreamActive) setCamStreamStatus("ENDED", "bad");
+  } catch (e) {
+    if (camStreamActive && e.name !== "AbortError") {
+      setCamStreamStatus("ERROR", "bad");
+      log("ERROR", `Camera stream: ${e.message}`);
+    }
+  }
 }
 
 function startCamStream() {
   if (camStreamActive) return;
   camStreamActive = true;
+  camStreamAbort = new AbortController();
   camFrameCount = 0; camFpsClock = Date.now();
   setCamStreamStatus("CONNECTING", "");
   if (D.vcamFps) D.vcamFps.textContent = "--";
   if (D.btnCamStreamOn) D.btnCamStreamOn.textContent = "⏹ STOP STREAM";
-  log("INFO", "Camera stream started (snapshot polling 2fps).");
-  camPollFrame();
+  log("INFO", "Camera stream started.");
+  camStreamLoop(camStreamAbort.signal);
 }
 
 function stopCamStream() {
   camStreamActive = false;
-  if (camStreamTimer) { clearTimeout(camStreamTimer); camStreamTimer = null; }
-  if (camImgEl && D.camFeedWrap && D.camFeedWrap.contains(camImgEl)) {
-    D.camFeedWrap.removeChild(camImgEl);
-    camImgEl = null;
+  if (camStreamAbort) { camStreamAbort.abort(); camStreamAbort = null; }
+  if (camCanvasEl && D.camFeedWrap && D.camFeedWrap.contains(camCanvasEl)) {
+    D.camFeedWrap.removeChild(camCanvasEl);
+    camCanvasEl = null;
+    camCtx = null;
   }
-  if (camLastUrl) { URL.revokeObjectURL(camLastUrl); camLastUrl = null; }
   if (D.camOffline) D.camOffline.style.display = "";
   setCamStreamStatus("IDLE", "");
   if (D.vcamFps) D.vcamFps.textContent = "--";
@@ -1056,8 +1159,8 @@ if (D.btnCamStart) {
       const r = await robotFetch("/camera/daemon/start", { method: "POST" });
       const j = await r.json();
       if (r.ok && j.ok) {
-        setCamDaemonStatus(`RUNNING (pid ${j.pid})`, "ok");
-        log("OK", `Camera daemon started, pid=${j.pid}`);
+        setCamDaemonStatus(j.pid ? `RUNNING (pid ${j.pid})` : "RUNNING", "ok");
+        log("OK", "Camera daemon started.");
       } else {
         setCamDaemonStatus("FAILED", "bad");
         log("ERROR", `Camera daemon: ${j.error || "unknown error"}`);
@@ -1095,13 +1198,13 @@ if (D.btnCamSnapshot) {
       const r = await robotFetch("/camera/snapshot");
       if (!r.ok) throw new Error(await r.text());
       const blob = await r.blob();
-      const url  = URL.createObjectURL(blob);
-      camEnsureImg();
-      camImgEl.src = url;
-      setTimeout(() => URL.revokeObjectURL(url), 10000);
+      const bytes = new Uint8Array(await blob.arrayBuffer());
+      await camDrawBmp(bytes);
       const a = document.createElement("a");
+      const url = URL.createObjectURL(blob);
       a.href = url; a.download = `vector-${Date.now()}.bmp`;
       document.body.appendChild(a); a.click(); document.body.removeChild(a);
+      setTimeout(() => URL.revokeObjectURL(url), 10000);
       log("OK", "Snapshot saved.");
       setCamStreamStatus("SNAPSHOT", "ok");
     } catch (e) {
