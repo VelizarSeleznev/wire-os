@@ -2240,8 +2240,8 @@ void pongGameLoop() {
       lastLeftEnc = curLeftEnc;
       lastRightEnc = curRightEnc;
       
-      leftPadY += deltaLeft * 0.35;
-      rightPadY += deltaRight * 0.35;
+      leftPadY += deltaRight * 0.35;
+      rightPadY -= deltaLeft * 0.35;
       
       if (leftPadY < 2) leftPadY = 2;
       if (leftPadY > boardH - padH - 2) leftPadY = boardH - padH - 2;
