@@ -17,6 +17,7 @@
 #include <termios.h>
 #include <unistd.h>
 #include <linux/spi/spidev.h>
+#include <poll.h>
 
 #include <algorithm>
 #include <atomic>
@@ -40,7 +41,7 @@
 
 namespace {
 
-constexpr const char* kApiVersion = "0.2.1";
+constexpr const char* kApiVersion = "0.2.7";
 constexpr const char* kSpineDevice = "/dev/ttyHS0";
 constexpr const char* kLcdDevice = "/dev/spidev1.0";
 constexpr const char* kImuDevice = "/dev/spidev0.0";
@@ -124,6 +125,11 @@ struct BodyToHead {
   int16_t audio[320];
 };
 
+struct MicroBodyToHead {
+  uint8_t buttonPressed;
+  uint8_t unused[3];
+};
+
 struct LightState {
   uint8_t ledColors[16];
 };
@@ -161,6 +167,7 @@ struct AnkiCameraFrame {
 constexpr uint32_t kSyncBodyToHead = 0x483242aa;
 constexpr uint32_t kSyncHeadToBody = 0x423248aa;
 constexpr uint16_t kPayloadDataFrame = 0x6466;
+constexpr uint16_t kPayloadBootFrame = 0x6662;
 
 std::atomic<bool> gRunning{true};
 
@@ -1187,13 +1194,42 @@ struct MotorPosCmd {
   int motor;       // 0=left, 1=right, 2=lift, 3=head
   int32_t ticks;   // signed target delta ticks
   double  power;   // 0.0-1.0 magnitude
+  double  minPower;
+  int     tolerance;
+  int     timeoutMs;
 };
 
 struct TrackDriveCmd {
   int32_t ticks;    // positive = forward, negative = reverse
   double  power;    // 0.0-1.0 magnitude
+  double  minPower;
+  int     tolerance;
   int     timeoutMs;
 };
+
+constexpr int kEncoderSignForPositivePower[4] = {
+  1,  // left track: positive power increases encoder ticks
+  -1, // right track: positive API power moves forward and decreases raw encoder ticks
+  1,  // lift
+  1,  // head
+};
+
+double powerForEncoderError(int motor, double encoderControl) {
+  if (motor < 0 || motor >= 4) return 0.0;
+  return encoderControl * static_cast<double>(kEncoderSignForPositivePower[motor]);
+}
+
+double slewTowards(double current, double target, double step) {
+  if (std::abs(target - current) <= step) return target;
+  return current + (target > current ? step : -step);
+}
+
+double shapedPowerForError(int32_t error, double maxPower, double minPower, double kp) {
+  if (error == 0) return 0.0;
+  const double magnitude = std::clamp(std::abs(static_cast<double>(error)) * kp,
+                                      std::abs(minPower), std::abs(maxPower));
+  return (error > 0 ? 1.0 : -1.0) * magnitude;
+}
 
 // Forward-declare gSpine so we can use it in the position thread.
 class Spine;
@@ -1291,19 +1327,62 @@ class Imu {
   bool init() {
     std::lock_guard<std::mutex> lock(mu_);
     if (fd_ >= 0) return true;
+
+    // Ensure the sensor is powered by enabling regulator 8916_l10
+    // Try both 8916_l10 and pm8909_l10 under /sys/kernel/debug/regulator/
+    bool regulatorEnabled = false;
+    for (const char* path : {
+        "/sys/kernel/debug/regulator/8916_l10/enable",
+        "/sys/kernel/debug/regulator/pm8909_l10/enable",
+        "/sys/kernel/debug/regulator/pm8909_regulator-l10/enable"
+    }) {
+      if (exists(path)) {
+        if (writeTextFile(path, "1")) {
+          printf("[IMU] Enabled regulator via %s\n", path);
+          fflush(stdout);
+          regulatorEnabled = true;
+          break;
+        }
+      }
+    }
+    if (!regulatorEnabled) {
+      // If debugfs regulator path is not found, try mounting debugfs first!
+      runCommand("mount -t debugfs none /sys/kernel/debug >/dev/null 2>&1");
+      // Try again
+      for (const char* path : {
+          "/sys/kernel/debug/regulator/8916_l10/enable",
+          "/sys/kernel/debug/regulator/pm8909_l10/enable"
+      }) {
+        if (exists(path)) {
+          if (writeTextFile(path, "1")) {
+            printf("[IMU] Enabled regulator after mounting debugfs via %s\n", path);
+            fflush(stdout);
+            regulatorEnabled = true;
+            break;
+          }
+        }
+      }
+    }
+    // Give some time for power to stabilize
+    usleep(50000);
+
     fd_ = open(kImuDevice, O_RDWR | O_CLOEXEC);
     if (fd_ < 0) {
       lastError_ = "imu spidev unavailable: " + std::string(strerror(errno));
       return false;
     }
 
-    uint8_t mode = SPI_MODE_3;
+    uint8_t mode = SPI_MODE_0;
     uint8_t bits = 8;
-    uint32_t speed = 1000000;
+    uint32_t speed = 15000000;
 
+    // Configure BOTH SPI Write and Read settings to ensure symmetric phase and speed clocking
     if (ioctl(fd_, SPI_IOC_WR_MODE, &mode) < 0 ||
+        ioctl(fd_, SPI_IOC_RD_MODE, &mode) < 0 ||
         ioctl(fd_, SPI_IOC_WR_BITS_PER_WORD, &bits) < 0 ||
-        ioctl(fd_, SPI_IOC_WR_MAX_SPEED_HZ, &speed) < 0) {
+        ioctl(fd_, SPI_IOC_RD_BITS_PER_WORD, &bits) < 0 ||
+        ioctl(fd_, SPI_IOC_WR_MAX_SPEED_HZ, &speed) < 0 ||
+        ioctl(fd_, SPI_IOC_RD_MAX_SPEED_HZ, &speed) < 0) {
       lastError_ = "failed to configure imu spi settings";
       close(fd_);
       fd_ = -1;
@@ -1311,17 +1390,55 @@ class Imu {
     }
 
     uint8_t whoami = 0;
-    if (!readRegisterLocked(0x75, &whoami, 1)) {
-      lastError_ = "failed to read WHO_AM_I register";
+    // BMI160 starts in I2C mode after power-up. Bosch recommends one dummy
+    // SPI read from 0x7f before normal register access to switch to SPI.
+    uint8_t dummy = 0;
+    readRegisterLocked(0x7F, &dummy, 1);
+
+    if (!readRegisterLocked(0x00, &whoami, 1)) {
+      lastError_ = "failed to read BMI160 CHIP_ID register";
+      close(fd_);
+      fd_ = -1;
+      return false;
+    }
+
+    if (whoami != 0xD1) {
+      char buf[96];
+      snprintf(buf, sizeof(buf), "unexpected BMI160 CHIP_ID 0x%02X, expected 0xD1", whoami);
+      lastError_ = buf;
       close(fd_);
       fd_ = -1;
       return false;
     }
 
     whoami_ = whoami;
+    printf("[IMU] SPI configuration successful. Detected BMI160 CHIP_ID = 0x%02X\n", whoami);
+    fflush(stdout);
 
-    if (!writeRegisterLocked(0x6B, 0x00)) {
-      lastError_ = "failed to wake up IMU";
+    // Power up accelerometer and gyroscope, then configure the same ranges and
+    // output rate used by Anki's original robot HAL.
+    if (!writeRegisterLocked(0x7E, 0x11)) {
+      lastError_ = "failed to power up BMI160 accelerometer";
+      close(fd_);
+      fd_ = -1;
+      return false;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+
+    if (!writeRegisterLocked(0x7E, 0x15)) {
+      lastError_ = "failed to power up BMI160 gyroscope";
+      close(fd_);
+      fd_ = -1;
+      return false;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(85));
+
+    if (!writeRegisterLocked(0x41, 0x03) ||  // ACC_RANGE: +/-2g
+        !writeRegisterLocked(0x40, 0x19) ||  // ACC_CONF: 200Hz
+        !writeRegisterLocked(0x43, 0x02) ||  // GYR_RANGE: +/-500dps
+        !writeRegisterLocked(0x42, 0x09) ||  // GYR_CONF: 200Hz, normal filter
+        !writeRegisterLocked(0x53, 0x44)) {  // INT_OUT_CTRL: open-drain, disabled
+      lastError_ = "failed to configure BMI160 ranges/rates/interrupts";
       close(fd_);
       fd_ = -1;
       return false;
@@ -1354,6 +1471,11 @@ class Imu {
     gx = gx_; gy = gy_; gz = gz_;
   }
 
+  double getTemp() {
+    std::lock_guard<std::mutex> lock(mu_);
+    return temp_;
+  }
+
  private:
   bool readRegisterLocked(uint8_t reg, uint8_t* val, size_t len) {
     if (fd_ < 0) return false;
@@ -1366,7 +1488,7 @@ class Imu {
     tr.tx_buf = reinterpret_cast<unsigned long>(tx.data());
     tr.rx_buf = reinterpret_cast<unsigned long>(rx.data());
     tr.len = len + 1;
-    tr.speed_hz = 1000000;
+    tr.speed_hz = 15000000;
     tr.bits_per_word = 8;
 
     if (ioctl(fd_, SPI_IOC_MESSAGE(1), &tr) < 0) return false;
@@ -1382,48 +1504,63 @@ class Imu {
     spi_ioc_transfer tr{};
     tr.tx_buf = reinterpret_cast<unsigned long>(tx);
     tr.len = 2;
-    tr.speed_hz = 1000000;
+    tr.speed_hz = 15000000;
     tr.bits_per_word = 8;
 
     return ioctl(fd_, SPI_IOC_MESSAGE(1), &tr) >= 0;
   }
 
   void pollLoop() {
-    uint8_t data[14];
+    uint8_t data[12];
     int diagCounter = 0;
     while (running_) {
       {
         std::lock_guard<std::mutex> lock(mu_);
         if (fd_ >= 0) {
-          if (readRegisterLocked(0x3B, data, 14)) {
-            int16_t raw_ax = static_cast<int16_t>((data[0] << 8) | data[1]);
-            int16_t raw_ay = static_cast<int16_t>((data[2] << 8) | data[3]);
-            int16_t raw_az = static_cast<int16_t>((data[4] << 8) | data[5]);
-            int16_t raw_gx = static_cast<int16_t>((data[8] << 8) | data[9]);
-            int16_t raw_gy = static_cast<int16_t>((data[10] << 8) | data[11]);
-            int16_t raw_gz = static_cast<int16_t>((data[12] << 8) | data[13]);
+          if (readRegisterLocked(0x0C, data, 12)) {
+            const auto le16 = [](uint8_t lo, uint8_t hi) {
+              return static_cast<int16_t>((static_cast<uint16_t>(hi) << 8) | lo);
+            };
 
-            ax_ = static_cast<double>(raw_ax) / 16384.0;
-            ay_ = static_cast<double>(raw_ay) / 16384.0;
-            az_ = static_cast<double>(raw_az) / 16384.0;
+            // BMI160 raw order is gyro xyz, accel xyz. Keep Anki's original
+            // Vector HAL axis mapping so API values match the robot frame.
+            int16_t raw_gx = le16(data[4], data[5]);
+            int16_t raw_gy = le16(data[2], data[3]);
+            int16_t raw_gz = -le16(data[0], data[1]);
+            int16_t raw_ax = le16(data[10], data[11]);
+            int16_t raw_ay = le16(data[8], data[9]);
+            int16_t raw_az = -le16(data[6], data[7]);
 
-            gx_ = static_cast<double>(raw_gx) / 131.0;
-            gy_ = static_cast<double>(raw_gy) / 131.0;
-            gz_ = static_cast<double>(raw_gz) / 131.0;
+            ax_ = static_cast<double>(raw_ax) * 2.0 / 32767.0;
+            ay_ = static_cast<double>(raw_ay) * 2.0 / 32767.0;
+            az_ = static_cast<double>(raw_az) * 2.0 / 32767.0;
+
+            gx_ = static_cast<double>(raw_gx) * 500.0 / 32767.0;
+            gy_ = static_cast<double>(raw_gy) * 500.0 / 32767.0;
+            gz_ = static_cast<double>(raw_gz) * 500.0 / 32767.0;
+
+            // Periodically read temperature (every 50 polls, i.e., once per second)
+            if (diagCounter == 0) {
+              uint8_t temp_data[2];
+              if (readRegisterLocked(0x20, temp_data, 2)) {
+                int16_t raw_temp = static_cast<int16_t>((static_cast<uint16_t>(temp_data[1]) << 8) | temp_data[0]);
+                // BMI160 temperature formula: raw * (64.0 / 32768.0) + 23.0
+                temp_ = static_cast<double>(raw_temp) * 64.0 / 32768.0 + 23.0;
+              }
+            }
 
             // Print diagnostics once per second (every 50 polls at 20ms)
             if (++diagCounter >= 50) {
               diagCounter = 0;
-              printf("[IMU] raw: ax=%d ay=%d az=%d gx=%d gy=%d gz=%d "
-                     "bytes: %02x%02x %02x%02x %02x%02x %02x%02x %02x%02x %02x%02x %02x%02x\n",
-                     raw_ax, raw_ay, raw_az, raw_gx, raw_gy, raw_gz,
+              printf("[IMU] bmi160 raw: ax=%d ay=%d az=%d gx=%d gy=%d gz=%d temp=%.2fC "
+                     "bytes: %02x%02x %02x%02x %02x%02x %02x%02x %02x%02x %02x%02x\n",
+                     raw_ax, raw_ay, raw_az, raw_gx, raw_gy, raw_gz, temp_,
                      data[0], data[1], data[2], data[3], data[4], data[5],
-                     data[6], data[7], data[8], data[9], data[10], data[11],
-                     data[12], data[13]);
+                     data[6], data[7], data[8], data[9], data[10], data[11]);
               fflush(stdout);
             }
           } else {
-            printf("[IMU] SPI read failed at 0x3B\n");
+            printf("[IMU] SPI read failed at BMI160 data registers\n");
             fflush(stdout);
           }
         }
@@ -1442,6 +1579,7 @@ class Imu {
 
   double ax_ = 0, ay_ = 0, az_ = 0;
   double gx_ = 0, gy_ = 0, gz_ = 0;
+  double temp_ = 0;
 };
 
 Imu gImu;
@@ -1815,6 +1953,17 @@ bool sendAll(int fd, const std::string& data) {
   return true;
 }
 
+bool sendChunk(int fd, const std::string& data) {
+  if (data.empty()) return true;
+  std::ostringstream out;
+  out << std::hex << data.size() << "\r\n" << data << "\r\n";
+  return sendAll(fd, out.str());
+}
+
+bool sendEndChunks(int fd) {
+  return sendAll(fd, "0\r\n\r\n");
+}
+
 void sendResponse(int fd, int code, const std::string& reason, const std::string& body,
                   const std::string& contentType = "application/json") {
   std::ostringstream out;
@@ -1841,6 +1990,13 @@ double numberField(const std::string& body, const std::string& name, double fall
   if (p == std::string::npos) return fallback;
   ++p;
   while (p < body.size() && isspace(static_cast<unsigned char>(body[p]))) ++p;
+  // Support boolean values true/false directly
+  if (p + 4 <= body.size() && body.compare(p, 4, "true") == 0) {
+    return 1.0;
+  }
+  if (p + 5 <= body.size() && body.compare(p, 5, "false") == 0) {
+    return 0.0;
+  }
   char* end = nullptr;
   double v = strtod(body.c_str() + p, &end);
   if (end == body.c_str() + p) return fallback;
@@ -1909,8 +2065,38 @@ class Spine {
   void setBackpack(const std::vector<uint8_t>& rgb) {
     std::lock_guard<std::mutex> lock(mu_);
     std::fill(std::begin(head_.lightState.ledColors), std::end(head_.lightState.ledColors), 0);
-    for (size_t i = 0; i < std::min<size_t>(rgb.size(), 12); ++i) {
+    // Square LEDs 0, 1, 2
+    size_t limit = std::min<size_t>(rgb.size(), 9);
+    for (size_t i = 0; i < limit; ++i) {
       head_.lightState.ledColors[i] = rgb[i];
+    }
+    // Status/Button LED 3
+    if (rgb.size() >= 12) {
+      head_.lightState.ledColors[9] = 255 - rgb[11];  // Physical Blue
+      head_.lightState.ledColors[10] = 255 - rgb[10]; // Physical Green
+      head_.lightState.ledColors[11] = 255 - rgb[9];  // Physical Red
+    } else if (rgb.size() >= 10) {
+      head_.lightState.ledColors[9] = 255;
+      head_.lightState.ledColors[10] = 255;
+      head_.lightState.ledColors[11] = 255;
+    }
+    sendFrameLocked();
+  }
+
+  void setBackpackLed(int led, uint8_t r, uint8_t g, uint8_t b) {
+    if (led < 0 || led >= 4) return;
+    std::lock_guard<std::mutex> lock(mu_);
+    if (led == 3) {
+      uint8_t temp_r = 255 - r;
+      uint8_t temp_g = 255 - g;
+      uint8_t temp_b = 255 - b;
+      head_.lightState.ledColors[9] = temp_b;  // Physical Blue
+      head_.lightState.ledColors[10] = temp_g; // Physical Green
+      head_.lightState.ledColors[11] = temp_r; // Physical Red
+    } else {
+      head_.lightState.ledColors[led * 3 + 0] = r;
+      head_.lightState.ledColors[led * 3 + 1] = g;
+      head_.lightState.ledColors[led * 3 + 2] = b;
     }
     sendFrameLocked();
   }
@@ -1919,6 +2105,26 @@ class Spine {
     std::lock_guard<std::mutex> lock(mu_);
     *valid = bodyValid_;
     return body_;
+  }
+
+  bool backButtonPressed() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    return powerButtonPressed_;
+  }
+
+  bool powerButtonPressed() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    return powerButtonPressed_;
+  }
+
+  uint64_t powerButtonHoldMs() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    if (!powerButtonPressed_ || powerButtonPressedAt_ == std::chrono::steady_clock::time_point{}) {
+      return 0;
+    }
+    return static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - powerButtonPressedAt_).count());
   }
 
  private:
@@ -1932,7 +2138,18 @@ class Spine {
     fd_ = open(kSpineDevice, O_RDWR | O_NOCTTY | O_NONBLOCK | O_CLOEXEC);
     if (fd_ < 0) return false;
     configureSpineSerial(fd_);
+    lastFrameAt_ = std::chrono::steady_clock::now();
     return true;
+  }
+
+  void reopenSerialLocked(const char* reason) {
+    if (fd_ >= 0) {
+      printf("[Spine] Reopening %s: %s\n", kSpineDevice, reason ? reason : "unknown");
+      fflush(stdout);
+      close(fd_);
+      fd_ = -1;
+    }
+    lastFrameAt_ = std::chrono::steady_clock::now();
   }
 
   void sendFrameLocked() {
@@ -1957,6 +2174,9 @@ class Spine {
         // Always send a frame at 50 Hz so the Spine MCU keeps responding
         // and telemetry (cliffs, distance, touch) is continuously updated.
         sendFrameLocked();
+        if (fd_ >= 0 && now - lastFrameAt_ > std::chrono::milliseconds(1500)) {
+          reopenSerialLocked("no body frame for 1500ms");
+        }
       }
       std::this_thread::sleep_for(std::chrono::milliseconds(20));
     }
@@ -1995,7 +2215,6 @@ class Spine {
   }
 
   void parseBuffer(std::vector<uint8_t>& buf) {
-    const size_t frameLen = sizeof(SpineHeader) + sizeof(BodyToHead) + sizeof(uint32_t);
     while (buf.size() >= sizeof(SpineHeader)) {
       size_t start = 0;
       bool found = false;
@@ -2012,24 +2231,52 @@ class Spine {
         return;
       }
       if (start > 0) buf.erase(buf.begin(), buf.begin() + start);
-      if (buf.size() < frameLen) return;
+      if (buf.size() < sizeof(SpineHeader)) return;
       SpineHeader hdr;
       memcpy(&hdr, buf.data(), sizeof(hdr));
-      if (hdr.payloadType != kPayloadDataFrame || hdr.bytesToFollow != sizeof(BodyToHead)) {
+      size_t payloadLen = 0;
+      if (hdr.payloadType == kPayloadDataFrame) {
+        payloadLen = sizeof(BodyToHead);
+      } else if (hdr.payloadType == kPayloadBootFrame) {
+        payloadLen = sizeof(MicroBodyToHead);
+      } else {
         buf.erase(buf.begin());
         continue;
       }
-      BodyToHead body;
-      memcpy(&body, buf.data() + sizeof(SpineHeader), sizeof(body));
+      if (hdr.bytesToFollow != payloadLen) {
+        buf.erase(buf.begin());
+        continue;
+      }
+      const size_t frameLen = sizeof(SpineHeader) + payloadLen + sizeof(uint32_t);
+      if (buf.size() < frameLen) return;
       uint32_t expected;
-      memcpy(&expected, buf.data() + sizeof(SpineHeader) + sizeof(body), sizeof(expected));
-      if (crc32(reinterpret_cast<const uint8_t*>(&body), sizeof(body)) == expected) {
+      const uint8_t* payload = buf.data() + sizeof(SpineHeader);
+      memcpy(&expected, payload + payloadLen, sizeof(expected));
+      if (crc32(payload, payloadLen) == expected) {
         {
           std::lock_guard<std::mutex> lock(mu_);
-          body_ = body;
-          bodyValid_ = true;
+          lastFrameAt_ = std::chrono::steady_clock::now();
+          if (hdr.payloadType == kPayloadDataFrame) {
+            BodyToHead body;
+            memcpy(&body, payload, sizeof(body));
+            body_ = body;
+            bodyValid_ = true;
+          } else if (hdr.payloadType == kPayloadBootFrame) {
+            MicroBodyToHead micro;
+            memcpy(&micro, payload, sizeof(micro));
+            const bool pressed = micro.buttonPressed != 0;
+            const auto now = std::chrono::steady_clock::now();
+            if (pressed && !powerButtonPressed_) {
+              powerButtonPressedAt_ = now;
+            } else if (!pressed) {
+              powerButtonPressedAt_ = {};
+            }
+            powerButtonPressed_ = pressed;
+          }
         }
-        if (gAudioStreamActive.load()) {
+        if (hdr.payloadType == kPayloadDataFrame && gAudioStreamActive.load()) {
+          BodyToHead body;
+          memcpy(&body, payload, sizeof(body));
           sendAudioUdp(body.audio, body.framecounter);
         }
       }
@@ -2042,6 +2289,9 @@ class Spine {
   HeadToBody head_{};
   BodyToHead body_{};
   bool bodyValid_ = false;
+  bool powerButtonPressed_ = false;
+  std::chrono::steady_clock::time_point powerButtonPressedAt_{};
+  std::chrono::steady_clock::time_point lastFrameAt_ = std::chrono::steady_clock::now();
   std::chrono::steady_clock::time_point motorDeadline_ = std::chrono::steady_clock::now();
   std::thread reader_;
   std::thread writer_;
@@ -2071,7 +2321,7 @@ void vvidPlayThread(std::string filepath) {
     gVvidPlaying.store(false);
     return;
   }
-  
+
   // 1. Read header
   char magic[4];
   in.read(magic, 4);
@@ -2079,35 +2329,35 @@ void vvidPlayThread(std::string filepath) {
     gVvidPlaying.store(false);
     return;
   }
-  
+
   uint32_t version = 0;
   uint32_t fps = 0;
   uint32_t frameCount = 0;
   uint32_t audioBytes = 0;
   uint32_t videoOffset = 0;
-  
+
   in.read(reinterpret_cast<char*>(&version), 4);
   in.read(reinterpret_cast<char*>(&fps), 4);
   in.read(reinterpret_cast<char*>(&frameCount), 4);
   in.read(reinterpret_cast<char*>(&audioBytes), 4);
   in.read(reinterpret_cast<char*>(&videoOffset), 4);
-  
+
   if (version != 1 || frameCount == 0 || fps == 0) {
     gVvidPlaying.store(false);
     return;
   }
-  
+
   // 2. Read audio WAV bytes and write to temp WAV
   std::string tempWav = "/tmp/vector-vvid.wav";
   if (audioBytes > 0) {
     std::vector<char> audioBuf(audioBytes);
     in.read(audioBuf.data(), audioBytes);
-    
+
     std::ofstream outWav(tempWav, std::ios::binary);
     if (outWav) {
       outWav.write(audioBuf.data(), audioBytes);
       outWav.close();
-      
+
       // Start playing WAV in background via aplay
       runCommand("killall aplay >/dev/null 2>&1");
       runCommand("/etc/initscripts/anki-audio-init >/tmp/vector-hw-audio-init.log 2>&1");
@@ -2115,24 +2365,24 @@ void vvidPlayThread(std::string filepath) {
       runCommand("(aplay " + shellQuote(tempWav) + " >/tmp/vector-vvid-aplay.log 2>&1 &)");
     }
   }
-  
+
   // 3. Play video frames loop
   in.seekg(videoOffset);
-  
+
   std::vector<char> frameBuf(kLcdWidth * kLcdHeight * 2); // 35328 bytes
   auto startTime = std::chrono::steady_clock::now();
   const int frameDurationMs = 1000 / fps;
-  
+
   for (uint32_t i = 0; i < frameCount && gVvidPlaying.load(); ++i) {
     in.read(frameBuf.data(), frameBuf.size());
     if (in.gcount() < static_cast<std::streamsize>(frameBuf.size())) break;
-    
+
     gLcd.drawFrame(std::string(frameBuf.data(), frameBuf.size()));
-    
+
     auto targetTime = startTime + std::chrono::milliseconds((i + 1) * frameDurationMs);
     std::this_thread::sleep_until(targetTime);
   }
-  
+
   // 4. Cleanup
   runCommand("killall aplay >/dev/null 2>&1");
   unlink(tempWav.c_str());
@@ -2153,15 +2403,34 @@ struct MotorHoldState {
   int32_t target = 0;
   double maxPower = 0.65;
   int deadband = 6;
-  
+
   // PID controller state
   double integral = 0.0;
   int32_t lastError = 0;
+  double lastPower = 0.0;
 };
 
 std::mutex gMotorHoldMutex;
 MotorHoldState gMotorHold[4];
 std::atomic<bool> gMotorHoldLoopStarted{false};
+
+struct MotorHoldGains {
+  double kp;
+  double ki;
+  double kd;
+  double minPower;
+  double slewStep;
+  double integralLimit;
+};
+
+constexpr MotorHoldGains kMotorHoldGains[4] = {
+  // Tracks are heavy and easy to overshoot, so hold corrections must be slow.
+  {0.0040, 0.0000, 0.0010, 0.06, 0.030, 0.0},
+  {0.0040, 0.0000, 0.0010, 0.06, 0.030, 0.0},
+  // Lift/head need less power near target than the old fixed 0.18 floor.
+  {0.0035, 0.0004, 0.0012, 0.05, 0.025, 60.0},
+  {0.0030, 0.0003, 0.0010, 0.04, 0.020, 50.0},
+};
 
 void motorHoldLoop() {
   while (gRunning) {
@@ -2179,28 +2448,37 @@ void motorHoldLoop() {
         if (std::abs(error) <= hold.deadband) {
           hold.integral = 0.0;
           hold.lastError = error;
+          hold.lastPower = 0.0;
           continue;
         }
 
-        // Accumulate integral with anti-windup clamping to prevent runaway
-        hold.integral += error;
-        hold.integral = std::clamp(hold.integral, -150.0, 150.0);
+        const auto& gains = kMotorHoldGains[m];
+        if ((error > 0) != (hold.lastError > 0)) {
+          hold.integral = 0.0;
+        }
+        if (gains.integralLimit > 0.0) {
+          hold.integral += error;
+          hold.integral = std::clamp(hold.integral, -gains.integralLimit, gains.integralLimit);
+        } else {
+          hold.integral = 0.0;
+        }
 
-        double derivative = error - hold.lastError;
+        double derivative = hold.lastError == 0 ? 0.0 : static_cast<double>(error - hold.lastError);
         hold.lastError = error;
 
-        // PID term calculation
-        double p_term = error * 0.015;
-        double i_term = hold.integral * 0.003;
-        double d_term = derivative * 0.005;
+        double p_term = error * gains.kp;
+        double i_term = hold.integral * gains.ki;
+        double d_term = derivative * gains.kd;
 
-        double p = p_term + i_term + d_term;
-        pw[m] = std::clamp(p, -hold.maxPower, hold.maxPower);
+        double p = powerForEncoderError(m, p_term + i_term + d_term);
+        p = std::clamp(p, -hold.maxPower, hold.maxPower);
 
-        // Ensure minimum power threshold to overcome static friction / gravity stall
-        if (std::abs(pw[m]) < 0.18) {
-          pw[m] = pw[m] > 0 ? 0.18 : -0.18;
+        if (std::abs(error) > hold.deadband * 4 && std::abs(p) > 0.0 && std::abs(p) < gains.minPower) {
+          p = p > 0 ? gains.minPower : -gains.minPower;
         }
+        p = std::clamp(p, hold.lastPower - gains.slewStep, hold.lastPower + gains.slewStep);
+        hold.lastPower = p;
+        pw[m] = p;
         active = true;
       }
     }
@@ -2225,11 +2503,19 @@ void disableMotorHold(int motor) {
   if (motor < 0 || motor > 3) return;
   std::lock_guard<std::mutex> lock(gMotorHoldMutex);
   gMotorHold[motor].enabled = false;
+  gMotorHold[motor].integral = 0.0;
+  gMotorHold[motor].lastError = 0;
+  gMotorHold[motor].lastPower = 0.0;
 }
 
 void disableAllMotorHolds() {
   std::lock_guard<std::mutex> lock(gMotorHoldMutex);
-  for (auto& h : gMotorHold) h.enabled = false;
+  for (auto& h : gMotorHold) {
+    h.enabled = false;
+    h.integral = 0.0;
+    h.lastError = 0;
+    h.lastPower = 0.0;
+  }
 }
 
 // Runs in a detached thread to drive a motor a fixed number of encoder ticks.
@@ -2245,9 +2531,6 @@ void motorPositionThread(MotorPosCmd cmd) {
   int32_t startPos = snap0.motor[m].position;
   int32_t targetPos = startPos + cmd.ticks;
 
-  // Direction of power: positive ticks → positive power
-  double pwr = (cmd.ticks >= 0 ? 1.0 : -1.0) * std::abs(cmd.power);
-
   // Build power array — zero for all other motors
   auto sendPower = [&](double p) {
     double pw[4] = {0, 0, 0, 0};
@@ -2258,17 +2541,35 @@ void motorPositionThread(MotorPosCmd cmd) {
   };
 
   const auto deadline = std::chrono::steady_clock::now() +
-                        std::chrono::milliseconds(kMotorPositionTtlMs);
+                        std::chrono::milliseconds(std::clamp(cmd.timeoutMs, 250, kMotorPositionTtlMs));
+  const int tolerance = std::clamp(cmd.tolerance, 1, 200);
+  const double maxPower = std::clamp(std::abs(cmd.power), 0.01, 1.0);
+  const double minPower = std::clamp(std::abs(cmd.minPower), 0.01, maxPower);
+  const double kp = (m == 0 || m == 1) ? 0.0050 : 0.0040;
+  const double slew = (m == 0 || m == 1) ? 0.055 : 0.035;
+  double lastPower = 0.0;
+  int stable = 0;
 
   while (!gMotorPosCancel[m].load() && std::chrono::steady_clock::now() < deadline) {
     BodyToHead snap = gSpine.snapshot(&valid);
     if (!valid) break;
     int32_t curPos = snap.motor[m].position;
-    // Check if target reached
-    bool done = (cmd.ticks >= 0) ? (curPos >= targetPos) : (curPos <= targetPos);
-    if (done) break;
+    int32_t error = targetPos - curPos;
+    if (std::abs(error) <= tolerance) {
+      sendPower(0.0);
+      lastPower = 0.0;
+      if (++stable >= 3) break;
+      std::this_thread::sleep_for(std::chrono::milliseconds(35));
+      continue;
+    }
+
+    stable = 0;
+    double encoderControl = shapedPowerForError(error, maxPower, minPower, kp);
+    double targetPower = powerForEncoderError(m, encoderControl);
+    double pwr = slewTowards(lastPower, targetPower, slew);
+    lastPower = pwr;
     sendPower(pwr);
-    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    std::this_thread::sleep_for(std::chrono::milliseconds(25));
   }
   stopMotorsHard();
 }
@@ -2284,26 +2585,55 @@ void trackDriveThread(TrackDriveCmd cmd) {
 
   const int32_t leftStart = start.motor[0].position;
   const int32_t rightStart = start.motor[1].position;
-  const int32_t absTicks = std::abs(cmd.ticks);
-  const bool forward = cmd.ticks >= 0;
-  const int32_t leftTarget = leftStart + (forward ? absTicks : -absTicks);
-  const int32_t rightTarget = rightStart + (forward ? -absTicks : absTicks);
-  const double power = std::abs(cmd.power) * (forward ? 1.0 : -1.0);
+  const int direction = cmd.ticks >= 0 ? 1 : -1;
+  const int32_t target = cmd.ticks;
+  const double maxPower = std::clamp(std::abs(cmd.power), 0.01, 1.0);
+  const double minPower = std::clamp(std::abs(cmd.minPower), 0.01, maxPower);
+  const int tolerance = std::clamp(cmd.tolerance, 1, 200);
   const auto deadline = std::chrono::steady_clock::now() +
                         std::chrono::milliseconds(std::clamp(cmd.timeoutMs, 250, kMotorPositionTtlMs));
+  double lastLeft = 0.0;
+  double lastRight = 0.0;
+  int stable = 0;
 
   while (!gTrackDriveCancel.load() && std::chrono::steady_clock::now() < deadline) {
     BodyToHead snap = gSpine.snapshot(&valid);
     if (!valid) break;
 
-    const int32_t leftPos = snap.motor[0].position;
-    const int32_t rightPos = snap.motor[1].position;
-    const bool leftDone = forward ? (leftPos >= leftTarget) : (leftPos <= leftTarget);
-    const bool rightDone = forward ? (rightPos <= rightTarget) : (rightPos >= rightTarget);
-    if (leftDone && rightDone) break;
+    const int32_t leftForward = snap.motor[0].position - leftStart;
+    const int32_t rightForward = -(snap.motor[1].position - rightStart);
+    const int32_t leftError = target - leftForward;
+    const int32_t rightError = target - rightForward;
 
-    gSpine.setMotors(leftDone ? 0.0 : power, rightDone ? 0.0 : power, 0, 0, 160);
-    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    if (std::abs(leftError) <= tolerance && std::abs(rightError) <= tolerance) {
+      gSpine.setMotors(0, 0, 0, 0, 120);
+      lastLeft = 0.0;
+      lastRight = 0.0;
+      if (++stable >= 3) break;
+      std::this_thread::sleep_for(std::chrono::milliseconds(35));
+      continue;
+    }
+
+    stable = 0;
+    const int32_t avgError = (leftError + rightError) / 2;
+    double base = shapedPowerForError(avgError, maxPower, minPower, 0.0045);
+    if ((base > 0) != (direction > 0)) {
+      base = direction * minPower;
+    }
+
+    const int32_t leftProgress = leftForward * direction;
+    const int32_t rightProgress = rightForward * direction;
+    const double sync = std::clamp((leftProgress - rightProgress) * 0.0035, -0.16, 0.16);
+    double leftPower = std::clamp(base - direction * sync, -maxPower, maxPower);
+    double rightPower = std::clamp(base + direction * sync, -maxPower, maxPower);
+
+    leftPower = slewTowards(lastLeft, leftPower, 0.055);
+    rightPower = slewTowards(lastRight, rightPower, 0.055);
+    lastLeft = leftPower;
+    lastRight = rightPower;
+
+    gSpine.setMotors(leftPower, rightPower, 0, 0, 160);
+    std::this_thread::sleep_for(std::chrono::milliseconds(25));
   }
 
   stopMotorsHard();
@@ -2313,6 +2643,8 @@ void trackDriveThread(TrackDriveCmd cmd) {
 std::string bodyJson() {
   bool valid = false;
   BodyToHead b = gSpine.snapshot(&valid);
+  const bool powerButton = gSpine.powerButtonPressed();
+  const uint64_t powerButtonHoldMs = gSpine.powerButtonHoldMs();
   std::ostringstream out;
   out << "{";
   out << "\"valid\":" << (valid ? "true" : "false");
@@ -2325,9 +2657,12 @@ std::string bodyJson() {
   out << ",\"temperature_raw\":" << b.battery.temperature;
   out << ",\"flags\":" << b.battery.flags << "}";
   out << ",\"motors\":[";
+  const char* motorNames[] = {"left_track", "right_track", "lift", "head"};
   for (int i = 0; i < 4; ++i) {
     if (i) out << ",";
-    out << "{\"position\":" << b.motor[i].position
+    out << "{\"id\":" << i
+        << ",\"name\":\"" << motorNames[i] << "\""
+        << ",\"position\":" << b.motor[i].position
         << ",\"delta\":" << b.motor[i].delta
         << ",\"time\":" << b.motor[i].time << "}";
   }
@@ -2338,12 +2673,24 @@ std::string bodyJson() {
   }
   out << "],\"proximity\":{";
   out << "\"status\":" << static_cast<unsigned>(b.proximity.rangeStatus);
-  out << ",\"range_mm\":" << b.proximity.rangeMM;
-  out << ",\"signal_rate\":" << b.proximity.signalRate;
-  out << ",\"ambient_rate\":" << b.proximity.ambientRate;
-  out << ",\"sample_count\":" << b.proximity.sampleCount << "}";
+  out << ",\"range_mm\":" << __builtin_bswap16(b.proximity.rangeMM);
+  out << ",\"signal_rate\":" << __builtin_bswap16(b.proximity.signalRate);
+  out << ",\"ambient_rate\":" << __builtin_bswap16(b.proximity.ambientRate);
+  out << ",\"sample_count\":" << __builtin_bswap16(b.proximity.sampleCount) << "}";
   out << ",\"touch\":[" << b.touchLevel[0] << "," << b.touchLevel[1] << "]";
   out << ",\"touch_hires\":[" << b.touchHires[0] << "," << b.touchHires[1] << "]";
+  out << ",\"buttons\":{\"power\":" << (powerButton ? "true" : "false")
+      << ",\"power_raw\":" << (powerButton ? 1 : 0)
+      << ",\"power_hold_ms\":" << powerButtonHoldMs
+      << ",\"back\":" << (powerButton ? "true" : "false")
+      << ",\"back_raw\":" << (powerButton ? 1 : 0) << "}";
+  if (gImu.initialized()) {
+    double ax, ay, az, gx, gy, gz;
+    gImu.getRaw(ax, ay, az, gx, gy, gz);
+    out << ",\"accel\":{\"x\":" << ax << ",\"y\":" << ay << ",\"z\":" << az << "}";
+    out << ",\"gyro\":{\"x\":" << gx << ",\"y\":" << gy << ",\"z\":" << gz << "}";
+    out << ",\"imu_temp\":" << gImu.getTemp();
+  }
   out << "}";
   return out.str();
 }
@@ -2398,25 +2745,315 @@ std::string statusJson() {
 
 std::vector<uint8_t> parseBackpackRgb(const std::string& body) {
   std::vector<uint8_t> out;
-  for (const char* key : {"r", "g", "b"}) {
-    (void)key;
-  }
   size_t pos = 0;
   while (out.size() < 12) {
-    size_t rpos = body.find("\"r\"", pos);
-    size_t gpos = body.find("\"g\"", pos);
-    size_t bpos = body.find("\"b\"", pos);
-    if (rpos == std::string::npos || gpos == std::string::npos || bpos == std::string::npos) break;
-    std::string one = body.substr(rpos, bpos - rpos + 16);
+    size_t start = body.find('{', pos);
+    if (start == std::string::npos) break;
+    size_t end = body.find('}', start);
+    if (end == std::string::npos) break;
+
+    std::string one = body.substr(start, end - start + 1);
     out.push_back(static_cast<uint8_t>(std::clamp(numberField(one, "r", 0), 0.0, 255.0)));
-    out.push_back(static_cast<uint8_t>(std::clamp(numberField(body.substr(gpos, 32), "g", 0), 0.0, 255.0)));
-    out.push_back(static_cast<uint8_t>(std::clamp(numberField(body.substr(bpos, 32), "b", 0), 0.0, 255.0)));
-    pos = bpos + 3;
+    out.push_back(static_cast<uint8_t>(std::clamp(numberField(one, "g", 0), 0.0, 255.0)));
+    out.push_back(static_cast<uint8_t>(std::clamp(numberField(one, "b", 0), 0.0, 255.0)));
+
+    pos = end + 1;
   }
   return out;
 }
 
+const char* kRunScriptVectorRobotModule = R"PYSDK(
+import json
+import os
+import time
+import urllib.error
+import urllib.request
+
+
+class VectorRobotError(RuntimeError):
+    pass
+
+
+class VectorRobot:
+    _MOTOR_NAME_TO_ID = {
+        "left": 0, "left_track": 0,
+        "right": 1, "right_track": 1,
+        "lift": 2,
+        "head": 3,
+    }
+
+    _LED_NAME_TO_ID = {
+        "back": 0,
+        "middle": 1,
+        "front": 2,
+        "button": 3,
+        "status": 3,
+    }
+
+    def __init__(self, host=None, port=8080, timeout=5.0):
+        if host is None:
+            api = os.environ.get("VECTOR_HW_API", "http://127.0.0.1:8080")
+            from urllib.parse import urlparse
+            parsed = urlparse(api)
+            host = parsed.hostname or "127.0.0.1"
+            port = parsed.port or port
+        self.host = host
+        self.port = port
+        self.timeout = timeout
+
+    @property
+    def base_url(self):
+        return "http://%s:%s" % (self.host, self.port)
+
+    def _resolve_motor(self, motor):
+        if isinstance(motor, int):
+            if motor not in (0, 1, 2, 3):
+                raise ValueError("motor must be 0..3")
+            return motor
+        key = str(motor).lower().strip()
+        if key not in self._MOTOR_NAME_TO_ID:
+            raise ValueError("unknown motor %r" % (motor,))
+        return self._MOTOR_NAME_TO_ID[key]
+
+    def _resolve_led(self, led):
+        if isinstance(led, int):
+            if led not in (0, 1, 2, 3):
+                raise ValueError("led must be 0..3")
+            return led
+        key = str(led).lower().strip()
+        if key not in self._LED_NAME_TO_ID:
+            raise ValueError("unknown led %r" % (led,))
+        return self._LED_NAME_TO_ID[key]
+
+    def request(self, method, path, body=None, content_type="application/json"):
+        data = None
+        headers = {}
+        if isinstance(body, dict):
+            data = json.dumps(body).encode("utf-8")
+            headers["Content-Type"] = content_type
+        elif isinstance(body, bytes):
+            data = body
+            headers["Content-Type"] = content_type
+        req = urllib.request.Request(self.base_url + path, data=data, headers=headers, method=method)
+        try:
+            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                payload = resp.read()
+                ctype = resp.headers.get("Content-Type", "")
+        except urllib.error.HTTPError as exc:
+            raise VectorRobotError("HTTP %s: %s" % (exc.code, exc.read().decode("utf-8", "replace")))
+        if "application/json" in ctype:
+            return json.loads(payload.decode("utf-8"))
+        return payload
+
+    def status(self):
+        return self.request("GET", "/v1/status")
+
+    def sensors(self):
+        return self.request("GET", "/v1/sensors")
+
+    def back_button_pressed(self):
+        buttons = self.sensors().get("buttons") or {}
+        return bool(buttons.get("power", buttons.get("back")))
+
+    def power_button_pressed(self):
+        buttons = self.sensors().get("buttons") or {}
+        return bool(buttons.get("power", buttons.get("back")))
+
+    def power_button_hold_ms(self):
+        buttons = self.sensors().get("buttons") or {}
+        return int(buttons.get("power_hold_ms", 0) or 0)
+
+    def motors_state(self):
+        return self.request("GET", "/v1/motors/state")
+
+    def get_state(self):
+        motors = self.motors_state()
+        sensors = self.sensors()
+        return {"status": self.status(), "sensors": sensors, "motors": motors.get("motors") or motors.get("motor") or [], "buttons": sensors.get("buttons") or {}}
+
+    def set_motors(self, left=0, right=0, lift=0, head=0, ttl_ms=250):
+        return self.request("POST", "/v1/motors", {"left": left, "right": right, "lift": lift, "head": head, "ttl_ms": ttl_ms})
+
+    def stop_motors(self):
+        return self.request("POST", "/v1/motors/stop")
+
+    def set_motors_for(self, left=0, right=0, lift=0, head=0, duration=0.25, ttl_ms=180):
+        deadline = time.monotonic() + max(0.0, min(float(duration), 5.0))
+        try:
+            while time.monotonic() < deadline:
+                self.set_motors(left, right, lift, head, ttl_ms)
+                time.sleep(0.05)
+        finally:
+            self.stop_motors()
+        return {"ok": True}
+
+    def drive_raw(self, left, right, duration):
+        return self.set_motors_for(left=left, right=right, duration=duration)
+
+    def move_motor(self, motor, ticks, power=0.5, min_power=None, tolerance=None, timeout_ms=None):
+        body = {"motor": self._resolve_motor(motor), "ticks": int(ticks), "power": float(power)}
+        if min_power is not None:
+            body["min_power"] = float(min_power)
+        if tolerance is not None:
+            body["tolerance"] = int(tolerance)
+        if timeout_ms is not None:
+            body["timeout_ms"] = int(timeout_ms)
+        return self.request("POST", "/v1/motors/position", body)
+
+    def drive_straight(self, ticks, power=0.45, timeout_ms=10000, min_power=None, tolerance=None):
+        body = {"ticks": int(ticks), "power": float(power), "timeout_ms": int(timeout_ms)}
+        if min_power is not None:
+            body["min_power"] = float(min_power)
+        if tolerance is not None:
+            body["tolerance"] = int(tolerance)
+        return self.request("POST", "/v1/motors/drive", body)
+
+    def hold_motor(self, motor, enabled=True, target=None, power=0.7, deadband=6):
+        body = {"motor": self._resolve_motor(motor), "enabled": 1 if enabled else 0}
+        if enabled:
+            body.update({"power": power, "deadband": deadband})
+            if target is not None:
+                body["target"] = target
+        return self.request("POST", "/v1/motors/hold", body)
+
+    def set_backpack_leds(self, r, g, b):
+        return self.request("POST", "/v1/leds/backpack", {"r": int(r), "g": int(g), "b": int(b)})
+
+    def set_backpack_led(self, led, r, g, b):
+        led = self._resolve_led(led)
+        return self.request("POST", "/v1/leds/backpack", {"led": led, "r": int(r), "g": int(g), "b": int(b)})
+)PYSDK";
+
 void handleApps(int fd, const std::string& method, const std::string& path, const std::string& body) {
+  if (method == "POST" && path == "/v1/apps/run-script") {
+    if (!exists("/usr/bin/python3")) {
+      return sendJsonError(fd, 500, "python3 is not installed on the robot");
+    }
+    if (!writeWholeFile("/tmp/vector_robot.py", kRunScriptVectorRobotModule)) {
+      return sendJsonError(fd, 500, "cannot write VectorRobot SDK module to tmp");
+    }
+    std::string scriptPath = "/tmp/run-script-" + std::to_string(fd) + ".py";
+    if (!writeWholeFile(scriptPath, body)) {
+      return sendJsonError(fd, 500, "cannot write script to tmp");
+    }
+
+    int pipefd[2];
+    if (pipe(pipefd) < 0) {
+      unlink(scriptPath.c_str());
+      return sendJsonError(fd, 500, "failed to create pipe");
+    }
+
+    pid_t pid = fork();
+    if (pid < 0) {
+      close(pipefd[0]);
+      close(pipefd[1]);
+      unlink(scriptPath.c_str());
+      return sendJsonError(fd, 500, "failed to fork");
+    }
+
+    if (pid == 0) {
+      // Child process
+      close(pipefd[0]); // close read end
+      dup2(pipefd[1], STDOUT_FILENO);
+      dup2(pipefd[1], STDERR_FILENO);
+      close(pipefd[1]);
+
+      char* argv[] = { (char*)"/usr/bin/python3", (char*)"-u", (char*)scriptPath.c_str(), nullptr };
+      execvp(argv[0], argv);
+      exit(127);
+    }
+
+    // Parent process
+    close(pipefd[1]); // close write end
+
+    // Send headers first
+    std::ostringstream hdr;
+    hdr << "HTTP/1.1 200 OK\r\n";
+    hdr << "Date: " << httpDate() << "\r\n";
+    hdr << "Server: vector-hw-api/" << kApiVersion << "\r\n";
+    hdr << "Connection: close\r\n";
+    hdr << "Content-Type: text/plain\r\n";
+    hdr << "Transfer-Encoding: chunked\r\n\r\n";
+    if (!sendAll(fd, hdr.str())) {
+      kill(pid, SIGKILL);
+      int status;
+      waitpid(pid, &status, 0);
+      close(pipefd[0]);
+      unlink(scriptPath.c_str());
+      return;
+    }
+
+    char buf[512];
+    bool clientAlive = true;
+    while (true) {
+      struct pollfd pfds[2];
+      pfds[0].fd = pipefd[0];
+      pfds[0].events = POLLIN;
+      pfds[1].fd = fd;
+      pfds[1].events = POLLIN | POLLERR | POLLHUP;
+
+      int ret = poll(pfds, 2, 1000); // 1s timeout
+      if (ret < 0) {
+        if (errno == EINTR) continue;
+        break;
+      }
+
+      // Check if client disconnected
+      if (pfds[1].revents & (POLLERR | POLLHUP)) {
+        clientAlive = false;
+        kill(pid, SIGKILL);
+        break;
+      }
+
+      // If there's data to read on the pipe
+      if (pfds[0].revents & POLLIN) {
+        ssize_t bytesRead = read(pipefd[0], buf, sizeof(buf));
+        if (bytesRead <= 0) {
+          break; // Pipe closed, child exited
+        }
+        if (clientAlive) {
+          if (!sendChunk(fd, std::string(buf, bytesRead))) {
+            clientAlive = false;
+            kill(pid, SIGKILL);
+            break;
+          }
+        }
+      }
+
+      // Also check if child process has exited
+      int status;
+      pid_t reaped = waitpid(pid, &status, WNOHANG);
+      if (reaped == pid) {
+        // Drain any remaining output in the pipe
+        while (true) {
+          struct pollfd pfd;
+          pfd.fd = pipefd[0];
+          pfd.events = POLLIN;
+          int r = poll(&pfd, 1, 0); // non-blocking check
+          if (r > 0 && (pfd.revents & POLLIN)) {
+            ssize_t bytesRead = read(pipefd[0], buf, sizeof(buf));
+            if (bytesRead > 0) {
+              if (clientAlive) {
+                sendChunk(fd, std::string(buf, bytesRead));
+              }
+            } else {
+              break;
+            }
+          } else {
+            break;
+          }
+        }
+        break;
+      }
+    }
+    close(pipefd[0]);
+    int status;
+    waitpid(pid, &status, 0);
+    sendEndChunks(fd);
+    unlink(scriptPath.c_str());
+    return;
+  }
+
   if (method == "GET" && path == "/v1/apps") {
     FILE* fp = popen("/usr/bin/vector-appctl list 2>&1", "r");
     if (!fp) return sendJsonError(fd, 500, "vector-appctl failed");
@@ -2472,12 +3109,17 @@ void handleApps(int fd, const std::string& method, const std::string& path, cons
 }
 
 bool isWebSocketRequest(const std::string& request) {
-  return request.find("Upgrade: websocket") != std::string::npos ||
-         request.find("upgrade: websocket") != std::string::npos;
+  size_t headerEnd = request.find("\r\n\r\n");
+  std::string headersPart = (headerEnd == std::string::npos) ? request : request.substr(0, headerEnd);
+  std::string lowerReq = headersPart;
+  std::transform(lowerReq.begin(), lowerReq.end(), lowerReq.begin(), ::tolower);
+  return lowerReq.find("upgrade: websocket") != std::string::npos;
 }
 
 std::string headerValue(const std::string& request, const std::string& name) {
-  std::string lowerReq = request;
+  size_t headerEnd = request.find("\r\n\r\n");
+  std::string headersPart = (headerEnd == std::string::npos) ? request : request.substr(0, headerEnd);
+  std::string lowerReq = headersPart;
   std::string lowerName = name;
   std::transform(lowerReq.begin(), lowerReq.end(), lowerReq.begin(), ::tolower);
   std::transform(lowerName.begin(), lowerName.end(), lowerName.begin(), ::tolower);
@@ -2593,17 +3235,17 @@ void handleClient(int fd) {
   if (method == "GET" && path == "/v1/capabilities") {
     // LLM-readable API manifest
     const char* caps = R"JSON({
-  "api_version": "0.2.0",
+  "api_version": "0.2.7",
   "base_url": "http://<robot-ip>:8080",
   "description": "Vector robot hardware API. All endpoints are HTTP. Motor power values are -1.0 to 1.0 (float). Encoder ticks are raw int32 from the Spine MCU body frame.",
   "endpoints": [
     {"method":"GET","path":"/v1/status","desc":"Full status: api_version, spine, display, imu, camera, audio, body (sensors+encoders)."},
-    {"method":"GET","path":"/v1/sensors","desc":"Raw body sensor snapshot: framecounter, battery, motors[4].position/delta, cliff[4], proximity.range_mm, touch[2]."},
+    {"method":"GET","path":"/v1/sensors","desc":"Raw body sensor snapshot: framecounter, battery, motors[4].position/delta, cliff[4], proximity.range_mm, touch[2], buttons.power, buttons.power_hold_ms. Compatibility aliases buttons.back/back_raw are also present."},
     {"method":"GET","path":"/v1/motors/state","desc":"Current encoder state for all 4 motors. Returns motors array with id (0=left_track, 1=right_track, 2=lift, 3=head), position (int32 ticks), delta (ticks since last frame), time."},
     {"method":"POST","path":"/v1/motors","desc":"Set raw motor power. Body: {left, right, lift, head: -1.0..1.0, ttl_ms: int}. Motors auto-stop when ttl_ms expires."},
-    {"method":"POST","path":"/v1/motors/position","desc":"Move a motor by a relative number of encoder ticks. Body: {motor: 0-3, ticks: int (signed), power: 0.0-1.0}. Returns immediately; motor runs in background and stops when ticks accumulated or 10s TTL expires."},
-    {"method":"POST","path":"/v1/motors/drive","desc":"Synchronously start both track motors for a relative straight drive. Body: {ticks: int (positive forward, negative reverse), power?:0.01..1.0, timeout_ms?:250..10000}. Returns immediately; background controller stops each track at its encoder target and sends repeated zero-power stop frames."},
-    {"method":"POST","path":"/v1/motors/hold","desc":"Enable or disable closed-loop encoder hold. Enable body: {motor:0-3, enabled:1, target?:ticks, power?:0.2..1.0, deadband?:ticks}. Disable body: {motor:0-3, enabled:0}."},
+    {"method":"POST","path":"/v1/motors/position","desc":"Profiled move of one motor by relative encoder ticks. Body: {motor:0-3, ticks:int signed, power?:0.01..1.0, min_power?:0.01..power, tolerance?:ticks, timeout_ms?:250..10000}. Returns immediately; robot-side controller tapers near target and stops after stable tolerance."},
+    {"method":"POST","path":"/v1/motors/drive","desc":"Profiled synchronized straight track drive. Body: {ticks:int physical forward-positive, power?:0.01..1.0, min_power?:0.01..power, tolerance?:ticks, timeout_ms?:250..10000}. Returns immediately; robot-side controller uses forward-normalized encoders, slew limiting, and cross-track sync."},
+    {"method":"POST","path":"/v1/motors/hold","desc":"Enable or disable closed-loop encoder hold. Enable body: {motor:0-3, enabled:1, target?:ticks, power?:0.05..1.0, deadband?:ticks}. Disable body: {motor:0-3, enabled:0}."},
     {"method":"POST","path":"/v1/motors/stop","desc":"Cancel any in-progress position commands and zero all motors. No body needed."},
     {"method":"POST","path":"/v1/leds/backpack","desc":"Set backpack LED color. Body: array of up to 4 objects [{r,g,b}] each 0-255."},
     {"method":"POST","path":"/v1/display/init","desc":"Initialize face LCD (required before first frame). Returns {ok, panel: 'santek'|'midas'}."},
@@ -2623,6 +3265,7 @@ void handleClient(int fd) {
     {"method":"GET","path":"/v1/events","desc":"Server-Sent Events stream of body_frame telemetry at ~5Hz. Also accepts WebSocket upgrade."},
     {"method":"GET","path":"/v1/apps","desc":"List installed local apps via vector-appctl."},
     {"method":"POST","path":"/v1/apps/install","desc":"Install app from uploaded tar.gz. Body: raw tar.gz bytes."},
+    {"method":"POST","path":"/v1/apps/run-script","desc":"Upload and run a Python script on the robot. Body: text/x-python or text/plain source. Streams stdout/stderr as HTTP chunked text. Intended for task-specific local control loops; scripts should call /v1/motors/stop or VectorRobot.stop_motors() in cleanup."},
     {"method":"POST","path":"/v1/apps/{id}/start","desc":"Start installed app by id."},
     {"method":"POST","path":"/v1/apps/{id}/stop","desc":"Stop running app by id."},
     {"method":"DELETE","path":"/v1/apps/{id}","desc":"Uninstall app by id."},
@@ -2635,13 +3278,16 @@ void handleClient(int fd) {
     "3": "head"
   },
   "notes": [
-    "Motors 0+1 (tracks) are mirrored: positive power = forward on both.",
+    "Motors 0+1 (tracks) are mirrored: positive power = forward on both; right-track encoder ticks decrease under positive power.",
+    "For physical forward-positive track deltas: left_forward_delta = left_raw_delta, right_forward_delta = -right_raw_delta.",
+    "Use /v1/motors/drive or /v1/motors/position for animation-like profiled motion. Raw /v1/motors is for joystick/diagnostic power only.",
     "Motor 2 (lift): positive power = up.",
     "Motor 3 (head): positive power = up/forward tilt.",
     "Encoder ticks accumulate indefinitely; use delta for velocity detection.",
     "Camera snapshot file is /tmp/vector-camera-snapshot.bmp; generated from Anki RGB888 shared-memory frames.",
     "Cliff sensors cliff[0-3] < 90 indicates cliff/air detected.",
     "Touch sensor touch[0] > 610 indicates touch active; touch[1] not populated.",
+    "The physical rear power button is exposed as buttons.power/buttons.power_hold_ms from Spine PAYLOAD_BOOT_FRAME/MicroBodyToHead.buttonPressed. buttons.back remains as a compatibility alias.",
     "Proximity range_mm 8190/8191 = out of range sentinel."
   ]
 })JSON";
@@ -2680,6 +3326,9 @@ void handleClient(int fd) {
     int motor = static_cast<int>(numberField(body, "motor", -1));
     int ticks  = static_cast<int>(numberField(body, "ticks", 0));
     double pwr = std::clamp(std::abs(numberField(body, "power", 0.5)), 0.01, 1.0);
+    double minPower = std::clamp(std::abs(numberField(body, "min_power", (motor == 0 || motor == 1) ? 0.25 : 0.08)), 0.01, pwr);
+    int tolerance = std::clamp(static_cast<int>(numberField(body, "tolerance", (motor == 0 || motor == 1) ? 12 : 8)), 1, 200);
+    int timeoutMs = std::clamp(static_cast<int>(numberField(body, "timeout_ms", kMotorPositionTtlMs)), 250, kMotorPositionTtlMs);
     if (motor < 0 || motor > 3) {
       sendJsonError(fd, 400, "motor must be 0-3 (0=left_track, 1=right_track, 2=lift, 3=head)");
     } else if (ticks == 0) {
@@ -2691,17 +3340,22 @@ void handleClient(int fd) {
       gMotorPosCancel[motor].store(true);
       std::this_thread::sleep_for(std::chrono::milliseconds(25));
       gMotorPosCancel[motor].store(false);
-      MotorPosCmd cmd{motor, ticks, pwr};
+      MotorPosCmd cmd{motor, ticks, pwr, minPower, tolerance, timeoutMs};
       std::thread(motorPositionThread, cmd).detach();
       std::ostringstream out;
       out << "{\"ok\":true,\"motor\":" << motor
           << ",\"ticks\":" << ticks
-          << ",\"power\":" << pwr << "}";
+          << ",\"power\":" << pwr
+          << ",\"min_power\":" << minPower
+          << ",\"tolerance\":" << tolerance
+          << ",\"timeout_ms\":" << timeoutMs << "}";
       sendResponse(fd, 200, "OK", out.str());
     }
   } else if (method == "POST" && path == "/v1/motors/drive") {
     int32_t ticks = static_cast<int32_t>(numberField(body, "ticks", 0));
-    double pwr = std::clamp(std::abs(numberField(body, "power", 0.35)), 0.01, 1.0);
+    double pwr = std::clamp(std::abs(numberField(body, "power", 0.45)), 0.01, 1.0);
+    double minPower = std::clamp(std::abs(numberField(body, "min_power", 0.25)), 0.01, pwr);
+    int tolerance = std::clamp(static_cast<int>(numberField(body, "tolerance", 12)), 1, 200);
     int timeoutMs = std::clamp(static_cast<int>(numberField(body, "timeout_ms", kMotorPositionTtlMs)),
                                250, kMotorPositionTtlMs);
     if (ticks == 0) {
@@ -2714,11 +3368,13 @@ void handleClient(int fd) {
       gTrackDriveCancel.store(true);
       std::this_thread::sleep_for(std::chrono::milliseconds(25));
       gTrackDriveCancel.store(false);
-      TrackDriveCmd cmd{ticks, pwr, timeoutMs};
+      TrackDriveCmd cmd{ticks, pwr, minPower, tolerance, timeoutMs};
       std::thread(trackDriveThread, cmd).detach();
       std::ostringstream out;
       out << "{\"ok\":true,\"ticks\":" << ticks
           << ",\"power\":" << pwr
+          << ",\"min_power\":" << minPower
+          << ",\"tolerance\":" << tolerance
           << ",\"timeout_ms\":" << timeoutMs << "}";
       sendResponse(fd, 200, "OK", out.str());
     }
@@ -2740,7 +3396,7 @@ void handleClient(int fd) {
         sendJsonError(fd, 503, "no live encoder state for motor hold");
       } else {
         int32_t target = static_cast<int32_t>(numberField(body, "target", snap.motor[motor].position));
-        double maxPower = std::clamp(std::abs(numberField(body, "power", 0.65)), 0.20, 1.0);
+        double maxPower = std::clamp(std::abs(numberField(body, "power", 0.25)), 0.05, 1.0);
         int deadband = std::clamp(static_cast<int>(numberField(body, "deadband", 6)), 1, 100);
         gMotorPosCancel[motor].store(true);
         {
@@ -2751,6 +3407,7 @@ void handleClient(int fd) {
           gMotorHold[motor].deadband = deadband;
           gMotorHold[motor].integral = 0.0;
           gMotorHold[motor].lastError = 0;
+          gMotorHold[motor].lastPower = 0.0;
         }
         ensureMotorHoldLoop();
         std::ostringstream out;
@@ -2768,8 +3425,19 @@ void handleClient(int fd) {
     stopMotorsHard();
     sendResponse(fd, 200, "OK", "{\"ok\":true}");
   } else if (method == "POST" && path == "/v1/leds/backpack") {
-    auto rgb = parseBackpackRgb(body);
-    gSpine.setBackpack(rgb);
+    int led = static_cast<int>(numberField(body, "led", -1));
+    if (led == -1) {
+      led = static_cast<int>(numberField(body, "index", -1));
+    }
+    if (led >= 0 && led < 4) {
+      uint8_t r = static_cast<uint8_t>(std::clamp(numberField(body, "r", 0), 0.0, 255.0));
+      uint8_t g = static_cast<uint8_t>(std::clamp(numberField(body, "g", 0), 0.0, 255.0));
+      uint8_t b = static_cast<uint8_t>(std::clamp(numberField(body, "b", 0), 0.0, 255.0));
+      gSpine.setBackpackLed(led, r, g, b);
+    } else {
+      auto rgb = parseBackpackRgb(body);
+      gSpine.setBackpack(rgb);
+    }
     sendResponse(fd, 200, "OK", "{\"ok\":true}");
   } else if (method == "POST" && path == "/v1/display/brightness") {
     int level = std::clamp(static_cast<int>(numberField(body, "level", 0)), 0, 255);
@@ -2853,7 +3521,6 @@ void handleClient(int fd) {
         sendJsonError(fd, 404, "video not found");
       } else {
         stopVvidPlaying();
-        gPongActive.store(false);
         gVvidPlaying.store(true);
         gVvidCurrentName = name;
         gVvidThread = std::thread(vvidPlayThread, filepath);
@@ -3002,7 +3669,7 @@ void handleClient(int fd) {
       runCommand("killall aplay >/dev/null 2>&1");
       runCommand("/etc/initscripts/anki-audio-init >/tmp/vector-hw-audio-init.log 2>&1");
       setAudioVolumePercent(gAudioVolumePercent.load());
-      int rc = runCommand("(aplay " + shellQuote(kAudioUploadPath) + " >/tmp/vector-hw-aplay.log 2>&1 &)"); 
+      int rc = runCommand("(aplay " + shellQuote(kAudioUploadPath) + " >/tmp/vector-hw-aplay.log 2>&1 &)");
       sendResponse(fd, rc == 0 ? 200 : 500, rc == 0 ? "OK" : "Error",
                    rc == 0 ? "{\"ok\":true,\"player\":\"aplay\"}" : "{\"error\":\"failed to start aplay\"}");
     }
@@ -3023,7 +3690,12 @@ int parsePort(int argc, char** argv) {
     if (std::string(argv[i]) == "--listen") {
       std::string listen = argv[i + 1];
       size_t colon = listen.rfind(':');
-      if (colon != std::string::npos) return std::atoi(listen.substr(colon + 1).c_str());
+      if (colon != std::string::npos) {
+        return std::atoi(listen.substr(colon + 1).c_str());
+      }
+      if (!listen.empty() && std::all_of(listen.begin(), listen.end(), ::isdigit)) {
+        return std::atoi(listen.c_str());
+      }
     }
   }
   return kDefaultPort;

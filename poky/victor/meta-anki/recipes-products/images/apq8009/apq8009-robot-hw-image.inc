@@ -44,6 +44,8 @@ IMAGE_INSTALL += "rmtstorage"
 IMAGE_INSTALL += "vector-hw-api"
 IMAGE_INSTALL += "vector-hw-cli"
 IMAGE_INSTALL += "vector-app-runner"
+IMAGE_INSTALL += "python3"
+IMAGE_INSTALL += "python3-modules"
 
 # Useful diagnostics for the hardware image.
 IMAGE_INSTALL += "${@oe.utils.conditional('USER_BUILD', '1', '', 'htop', d)}"

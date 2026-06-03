@@ -87,12 +87,16 @@ Current exported files:
 ```text
 apq8009-robot-boot.img
 zImage-dtb-apq8009-robot.bin
+machine-hw-image-apq8009-robot.rootfs-20260531091511.ext4
+machine-hw-image-apq8009-robot.rootfs-20260531091511.manifest
+machine-hw-image-apq8009-robot.rootfs-20260531091511.testdata.json
 machine-hw-image-apq8009-robot.rootfs-20260522113639.ext4
 machine-hw-image-apq8009-robot.rootfs-20260522113639.manifest
 machine-hw-image-apq8009-robot.rootfs-20260522113639.testdata.json
 ota-manifest.ini
 vicos-20180309123456.ota
 vicos-20260522212342.ota
+vicos-20260531091618.ota
 ```
 
 The OTA was generated with the existing `ota/Makefile` using the built
@@ -171,12 +175,20 @@ services needed for a remotely managed hardware endpoint:
   `mm-camera`, `rmtstorage`.
 - Diagnostics: `htop`, `procps`, `net-tools`, `util-linux-dmesg` on non-user
   builds.
+- Robot-side scripting: `python3`, `python3-modules`, and split runtime
+  packages needed by the SDK (`python3-core`, `python3-json`,
+  `python3-netclient`).
 
 It explicitly removes the Anki personality/service graph:
 
 ```text
 anki-robot-target victor vic-* wired
 ```
+
+The `vector-hw` recipe also masks `vic-engine.service` with a `/dev/null`
+systemd unit in the image. This guards against leftover stock units from the
+base rootfs trying to start, grabbing hardware resources, or displaying
+`vic-engine crashed` UI during boot.
 
 ## API Surface
 
@@ -185,10 +197,13 @@ anki-robot-target victor vic-* wired
 Implemented endpoints:
 
 - `GET /v1/status`
-- `GET /v1/sensors`
+- `GET /v1/sensors` — includes `buttons.power` / `buttons.power_hold_ms` from
+  the Spine boot-frame; `buttons.back` remains as a compatibility alias
+  button payload when the physical back button is reported.
 - `GET /v1/motors/state`
 - `POST /v1/motors`
 - `POST /v1/motors/position`
+- `POST /v1/motors/drive`
 - `POST /v1/motors/hold`
 - `POST /v1/motors/stop`
 - `POST /v1/leds/backpack`
@@ -206,6 +221,7 @@ Implemented endpoints:
 - `GET /v1/events`
 - `GET /v1/apps`
 - `POST /v1/apps/install`
+- `POST /v1/apps/run-script`
 - `POST /v1/apps/<id>/start`
 - `POST /v1/apps/<id>/stop`
 - `DELETE /v1/apps/<id>`
@@ -251,13 +267,32 @@ image. The updated `vector-hw-api` and `vector-hw-cli` were copied over SSH as
 a hot-patch after remounting `/` read-write, and `vector-hw-api.service` was
 restarted successfully.
 
+On 2026-05-31, `vector-hw` and `machine-hw-image` were rebuilt after SDK/MCP
+and script-runner changes. The final successful image tasks included
+`vector-hw:do_compile`, `vector-hw:do_install`, `vector-hw:do_package`,
+`machine-hw-image:do_rootfs`, `machine-hw-image:do_image_ext4`, and
+`machine-hw-image:do_image_complete`. The exported manifest
+`machine-hw-image-apq8009-robot.rootfs-20260531091511.manifest` includes
+`python3-core`, `python3-json`, `python3-netclient`, and `python3-modules` for
+robot-side uploaded Python scripts. The OTA
+`vicos-20260531091618.ota` was packaged, but deploy to `192.168.1.89` did not
+run because the robot was unreachable over SSH/HTTP.
+
+Later on 2026-05-31 the robot was found at `192.168.1.93` (`vector.home`).
+`vicos-20260531091618.ota` was deployed with `update-os`; the update reached
+`100%`, rebooted, and `vector-hw-api` returned on `192.168.1.93:8080`.
+`/usr/bin/python3` was still absent after the OTA, so the prepared
+`python3-armv7.tar.gz` runtime was installed to `/usr` over SSH as a hotfix.
+After that, `/v1/apps/run-script` and MCP `run_python_async` were validated
+with scripts importing `VectorRobot` from the injected `/tmp/vector_robot.py`.
+
 ## Hardware Ownership
 
 Only `vector-hw-api` should open direct hardware devices:
 
 - Spine/body MCU: `/dev/ttyHS0`
 - Face LCD SPI: `/dev/spidev1.0`
-- IMU SPI presence check: `/dev/spidev0.0`
+- IMU SPI: `/dev/spidev0.0` Bosch BMI160
 - Face backlight: `/sys/class/leds/face-backlight*`
 
 Extension apps must call the local API instead of opening devices directly.
@@ -334,11 +369,22 @@ Additional hardware notes:
 
 - Motor encoder telemetry is present in Spine frames and exposed as
   `motor[].position`, `motor[].delta`, and `motor[].time`. `POST
-  /v1/motors/position` handles relative encoder moves, `POST /v1/motors/drive`
-  handles synchronized straight track moves, and `POST /v1/motors/hold` now
-  runs a robot-side closed-loop hold for one motor.
-- Motion sensors/IMU are still suspect on the observed robot: the SPI path
-  returns a stable WHO_AM_I but accel/gyro values remain effectively constant.
+  /v1/motors/position` handles profiled relative encoder moves with optional
+  `min_power`, `tolerance`, and `timeout_ms`; `POST /v1/motors/drive` handles
+  profiled synchronized straight track moves using physical forward-positive
+  ticks. `POST /v1/motors/hold` runs a robot-side closed-loop hold for one
+  motor, but remains guarded for validation because active hold can oscillate
+  under disturbance. Track encoder sign is mirrored: positive power increases
+  left-track ticks but decreases right-track ticks, so robot-side position,
+  drive, and hold control apply per-motor encoder sign correction.
+- `/v1/apps/run-script` lets trusted local clients upload and run a Python
+  script on the robot, streaming stdout/stderr with HTTP chunked transfer. Use
+  this for task-specific control loops that are too latency-sensitive for
+  direct LLM step-by-step control. Scripts must clean up movement with
+  `VectorRobot.stop_motors()` or `/v1/motors/stop`. Before execution the daemon
+  writes a small `/tmp/vector_robot.py` module, so uploaded scripts can use the
+  same `from vector_robot import VectorRobot` import as local SDK scripts.
+- Motion sensors/IMU are fully working: the SPI path uses the original Bosch BMI160 register path (SPI mode 0, 15MHz). The API programmatically enables the analog power regulator (8916_l10) on startup and successfully queries the CHIP_ID (0xD1). Live scaled accelerometer, gyroscope, and temperature readings are exposed in `/v1/status`, `/v1/sensors`, and event streams.
 - The image contains `mm-camera`, `mm-qcamera-daemon`, and `mm-anki-camera`
   binaries. The API starts or adopts `mm-qcamera-daemon`, starts
   `mm-anki-camera-wrapper -v 0 -r 1`, then owns the original Anki camera client

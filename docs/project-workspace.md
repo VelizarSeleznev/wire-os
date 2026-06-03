@@ -44,8 +44,12 @@ Last successful exported hardware-image artifacts:
 
 - `vicos-20180309123456.ota`
 - `vicos-20260522212342.ota`
+- `vicos-20260531091618.ota`
 - `apq8009-robot-boot.img`
 - `zImage-dtb-apq8009-robot.bin`
+- `machine-hw-image-apq8009-robot.rootfs-20260531091511.ext4`
+- `machine-hw-image-apq8009-robot.rootfs-20260531091511.manifest`
+- `machine-hw-image-apq8009-robot.rootfs-20260531091511.testdata.json`
 - `machine-hw-image-apq8009-robot.rootfs-20260522113639.ext4`
 - `machine-hw-image-apq8009-robot.rootfs-20260522113639.manifest`
 - `machine-hw-image-apq8009-robot.rootfs-20260522113639.testdata.json`
@@ -57,6 +61,17 @@ tools/vector-web-ui
 
 Canonical web UI source. The old sibling directory
 `/Users/velizard/Projects/vector-web-ui` is not the canonical copy anymore.
+
+```text
+scripts/seggver-runtime.sh
+```
+
+One-command deploy/status helper for the always-on server runtime on
+`seggver`. It syncs `tools/vector-web-ui` and `tools/vector-robot-sdk` to
+`egg@seggver:/home/egg/wire-os-runtime`, starts the Docker Compose web UI, and
+installs the MCP SSH wrapper. It also supports `deploy-github`, which runs from
+a clean server checkout of `VelizarSeleznev/wire-os:main`. See
+`docs/seggver-runtime.md`.
 
 ```text
 tools/vector-robot-sdk
@@ -71,6 +86,16 @@ Local LLM/client tooling for the robot HTTP API:
 See `docs/vector-mcp.md` for the MCP tool contract, including the motor map
 exposed to models: `0=left_track`, `1=right_track`, `2=lift`, `3=head`.
 
+Behavior-level planning lives in:
+
+```text
+docs/vector-high-level-behaviors.md
+```
+
+Use it for calibrated lift/head movement, safe hold, DDL animation playback,
+charger docking, beamforming, and other features built above the raw hardware
+API.
+
 ## Current Verified State
 
 On 2026-05-22, `machine-hw-image` built successfully:
@@ -84,6 +109,10 @@ The generated manifest includes:
 - `vector-hw-api`
 - `vector-hw-cli`
 - `vector-app-runner`
+- `python3-core`
+- `python3-json`
+- `python3-netclient`
+- `python3-modules`
 - `openssh`
 - `audiohal`
 - `mm-camera`
@@ -97,6 +126,28 @@ The generated manifest does not include:
 - `vic-*`
 - `wired`
 - `anki-robot-target`
+
+On 2026-05-31, the robot was reachable as `vector.home` at `192.168.1.93`
+rather than the older `192.168.1.89` address. OTA
+`vicos-20260531091618.ota` was deployed and the API returned after reboot.
+Robot-side Python script upload required a post-OTA hotfix install of the
+prepared ARMv7 Python runtime tarball because `/usr/bin/python3` was absent on
+the booted system.
+
+For non-robot tooling, the preferred stable runtime is now `seggver`:
+
+```text
+http://192.168.1.63:9786/
+```
+
+Deploy or inspect it with:
+
+```sh
+scripts/seggver-runtime.sh
+scripts/seggver-runtime.sh github-status
+scripts/seggver-runtime.sh deploy-github
+scripts/seggver-runtime.sh status
+```
 
 ## Known Gaps
 
@@ -120,5 +171,7 @@ status table and roadmap.
 2. Read `AGENTS.md`.
 3. Read `docs/vector-hw-image.md`.
 4. Read `docs/vector-hardware-status.md`.
-5. Read `docs/vector-web-ui.md` if working on the browser control site.
-6. Use `/Volumes/wire-os-cs/wire-os` only for full Yocto builds.
+5. Read `docs/seggver-runtime.md` if working on web UI, MCP, TTS, or server
+   runtime.
+6. Read `docs/vector-web-ui.md` if working on the browser control site.
+7. Use `/Volumes/wire-os-cs/wire-os` only for full Yocto builds.

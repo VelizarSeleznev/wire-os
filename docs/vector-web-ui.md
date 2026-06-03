@@ -19,6 +19,28 @@ It talks to `vector-hw-api` on the robot through a Bun proxy server:
 browser <-> Bun server on localhost:3000 <-> robot vector-hw-api on :8080
 ```
 
+For normal use, the Bun server should run on the always-on `seggver` runtime:
+
+```text
+browser <-> http://192.168.1.63:9786 <-> Bun container on seggver <-> robot
+```
+
+Deploy/update that runtime with:
+
+```sh
+scripts/seggver-runtime.sh
+```
+
+After the relevant changes are committed and pushed to GitHub, switch the
+server to the GitHub-backed checkout:
+
+```sh
+scripts/seggver-runtime.sh deploy-github
+```
+
+See `docs/seggver-runtime.md`. Use local `localhost` runs only for short
+frontend debugging before deploying the same source to `seggver`.
+
 Current firmware/hardware capability status is tracked in:
 
 ```text
@@ -42,14 +64,26 @@ Default URL:
 http://localhost:3000
 ```
 
+Stable server URL:
+
+```text
+http://192.168.1.63:9786/
+```
+
 Environment:
 
 - `PORT`: UI/proxy server port, default `3000`.
 - `VECTOR_ROBOT_IP`: default robot IP shown to clients and used by the proxy.
+- `VECTOR_ROBOT_PORT`: robot API port, default `8080`.
+- `VECTOR_ANIMATIONS_ROOT`: DDL animation asset root, default
+  `/tmp/vector-animations-build/assets`. The server expects JSON clips under
+  `${VECTOR_ANIMATIONS_ROOT}/animations`.
 
 ## Implemented UI Surface
 
 - Connect/disconnect WebSocket to local Bun proxy.
+- Status dashboard for API, Spine MCU, battery, motors, display, camera,
+  audio, Python runner, sensors, and live motor positions.
 - Drive joystick with server-side motor ramping.
 - Head and lift sliders.
 - Backpack LED color presets.
@@ -58,8 +92,20 @@ Environment:
 - Face display video preview and repeated RGB565 frame streaming.
 - Browser-side audio decode/resample to 16 kHz mono WAV, client-side volume
   gain, and audio stop controls.
+- DDL animation browser under the `ANIMATIONS` tab:
+  - indexes JSON clips and animation groups from `VECTOR_ANIMATIONS_ROOT`;
+  - shows clip path, duration, supported track counts, group candidate clips,
+    and group weights;
+  - can play a selected clip or group by generating a Python script and
+    uploading it to `/v1/apps/run-script`;
+  - can stop motors/audio for the selected robot.
 - Telemetry relay from robot `/v1/events` SSE stream.
 - Battery, cliff, touch, frame-counter display.
+- Physical power button state display, fed by `buttons.power` telemetry with
+  `buttons.back` accepted as a compatibility alias.
+- Encoder panel displays a zeroed, physical forward-positive view for tracks:
+  left raw ticks are used as-is and right raw ticks are inverted. Raw absolute
+  Spine counters remain visible in the value tooltip.
 - Real-time 16 kHz mono microphone audio streaming from robot to browser via UDP 5005 relay with low-latency Web Audio queuing.
 - Circular beamforming sound visualizer showing dynamic RMS energies for all 4 microphones and pointer arrow for active sound-source direction.
 - Browser-side real-time WAV recording and download of the beamformed microphone stream.
@@ -74,6 +120,10 @@ The imported copy was adjusted so it is easier to reuse from this project:
 - Default robot IP can be set with `VECTOR_ROBOT_IP`.
 - Server port can be set with `PORT`.
 - Browser accepts the server-sent default IP when no local IP has been saved.
+- `/api/config` exposes the Bun proxy's configured robot IP and port so the UI
+  opens on the active robot instead of a stale browser `localStorage` value.
+- The first tab is now a robot status dashboard with manual refresh, a safe
+  Python runner smoke check, and an immediate motor stop button.
 - Telemetry watchdog no longer creates a new interval on every reconnect.
 - `package.json` has `dev`, `start`, and `check` scripts.
 - The main control surface is split into tabs for motors, camera, display, and
@@ -83,10 +133,83 @@ The imported copy was adjusted so it is easier to reuse from this project:
 - Encoder rows accept both the current `motors` telemetry field and the older
   `motor` field, and `bun run check` now also bundles browser `public/app.js`
   so frontend syntax regressions are caught.
+- The encoder panel has `ZERO ENCODER VIEW`, which rebases all displayed
+  positions to the latest telemetry sample. This makes manual track tests read
+  from zero without changing the robot's raw accumulated encoder counters.
+- The `ANIMATIONS` tab adds local endpoints:
+  - `GET /local/animations`
+  - `POST /local/animations/play`
+  - `POST /local/animations/stop`
+  These endpoints are intentionally local-server endpoints for the current
+  prototype, not stable robot firmware API endpoints yet. Groups are resolved
+  server-side to a concrete available clip before script generation.
 
 ## Verification
 
 Last local smoke test: 2026-05-24.
+
+Dashboard smoke test: 2026-05-31.
+
+Server runtime smoke test:
+
+```sh
+scripts/seggver-runtime.sh
+curl http://192.168.1.63:9786/api/config
+```
+
+If the web UI is healthy but the robot is off/asleep/discharged, the runtime
+deploy is still considered successful. Report robot availability separately
+from server availability.
+
+Commands:
+
+```sh
+cd tools/vector-web-ui
+bun run check
+PORT=3124 VECTOR_ROBOT_IP=192.168.1.93 VECTOR_ROBOT_PORT=8080 bun run server.js
+curl http://localhost:3124/api/config
+```
+
+Result:
+
+- `bun run check` passed for `server.js` and browser `public/app.js`.
+- `/api/config` returned `{"ip":"192.168.1.93","port":8080}`.
+- In-app browser loaded `http://localhost:3124/` with no console warnings or
+  errors.
+- Dashboard reached robot `192.168.1.93:8080` and rendered API `0.2.1`, Spine
+  connected, battery voltage, 4 motor rows, display presence, camera daemon,
+  audio status, sensors, and live motor positions.
+- `PYTHON CHECK` uploaded and executed a short `vector_robot` script through
+  `/v1/apps/run-script`; output reported API `0.2.1` and 4 motors.
+- Responsive smoke test at `390x844` rendered the dashboard without top-bar
+  clipping after the mobile layout fix.
+- Follow-up validation after robot hot-patch to API `0.2.2`: dashboard renders
+  `buttons.power` as `power up/down`; WebSocket telemetry updates the right-side
+  sensor panel after `CONNECT`, and the robot API framecounter increments.
+- WebSocket motor safety fix: the Bun proxy now zeros both target and ramped
+  motor state on every WebSocket open/close and sends `/v1/motors/stop`. This
+  prevents stale motor targets from an old browser connection surviving a
+  reload while another client is still connected. Validated through the same
+  WebSocket path as the browser: `left:-0.25` changed the left-track encoder in
+  the negative direction.
+- Track encoder display fix: the Motors tab now shows `FWD` ticks relative to
+  the last zero point, using the same convention as SDK `drive_distance`:
+  left forward is raw positive, right forward is raw negative. This matches the
+  original Spine `MotorState.position/delta` protocol, which reports signed raw
+  encoder counters without a separate physical-direction field.
+- Current browser validation on `http://localhost:3124/`: after reload and
+  `CONNECT`, telemetry was alive and the Motors tab rendered both tracks as
+  `FWD +0` with raw counters in the tooltip. A short WebSocket-path motor
+  command through the Bun proxy changed track encoder counts and then stopped
+  the robot via `/v1/motors/stop`.
+- Animation tab validation on `http://localhost:3124/` with
+  `VECTOR_ANIMATIONS_ROOT=/tmp/vector-animations-build/assets`: the tab listed
+  `1823/1823` items in the in-app browser (`1186` clips and `637` groups).
+  `anim_avs_back2listen_03`, `anim_attention_lookatdevice_01`, and group
+  `ag_vc_laser_lookdown` ran through the Bun server to `/v1/apps/run-script`
+  on robot `192.168.1.93` and completed. The group resolved to
+  `anim_vc_laser_lookdown_01`. Unsupported DDL tracks were surfaced in script
+  output instead of being silently ignored.
 
 Commands:
 
@@ -160,6 +283,15 @@ The UI is not production-grade yet.
   browser UI parses the multipart stream and draws BMP frames onto a canvas,
   using native `createImageBitmap(image/bmp)` when available and a manual 24-bit
   BMP decoder as fallback.
+- Animation playback is a prototype. It supports head/lift/LED/procedural face
+  tracks approximately, resolves DDL animation groups, uses non-blocking
+  profiled joint position commands for scheduled head/lift keyframes, maps
+  straight body motion to `/v1/motors/drive` where possible, falls back to
+  bounded timed motor power for arcs/turns, and logs unsupported
+  `FaceAnimationKeyFrame`, `RobotAudioKeyFrame`, `EventKeyFrame`, and
+  heading-record/turn tracks. It should become a robot-side app/daemon once
+  calibrated joint movement, sprite rendering, and audio event mapping are
+  implemented.
   This differs from wire-pod's stock-runtime path, which decodes robot
   `ImageChunk` data server-side and re-encodes multipart JPEG for the browser.
   The default firmware output is now RGB888-derived color.

@@ -9,6 +9,9 @@ const S = {
   ws:        null,
   connected: false,
   telemetryWatchdog: null,
+  dashboardTimer: null,
+  lastStatus: null,
+  lastDashboardRefresh: 0,
   // Local target motor state (server does the actual ramping)
   motors: { left: 0, right: 0, lift: 0, head: 0 },
   // Telemetry heartbeat
@@ -62,7 +65,7 @@ const D = {
   vfl: $("vfl"), vfr: $("vfr"), vbl: $("vbl"), vbr: $("vbr"),
   vax: $("vax"), vay: $("vay"), vaz: $("vaz"),
   vgx: $("vgx"), vgy: $("vgy"), vgz: $("vgz"),
-  vt0: $("vt0"), vfc: $("vfc"),
+  vt0: $("vt0"), vBackBtn: $("vback-btn"), vfc: $("vfc"),
   vproxDist: $("vprox-dist"), vproxStatus: $("vprox-status"),
   btnMicToggle: $("btn-mic-toggle"),
   btnMicRecord: $("btn-mic-record"),
@@ -75,6 +78,16 @@ const D = {
   vvidFileInput: $("vvid-file-input"),
   btnVvidUpload: $("btn-vvid-upload"),
   vvidUploadStatus: $("vvid-upload-status"),
+  animFilter: $("anim-filter"),
+  btnAnimRefresh: $("btn-anim-refresh"),
+  btnAnimPlay: $("btn-anim-play"),
+  btnAnimStop: $("btn-anim-stop"),
+  animRoot: $("anim-root"),
+  animCount: $("anim-count"),
+  animList: $("anim-list"),
+  animSelected: $("anim-selected"),
+  animStatus: $("anim-status"),
+  animOutput: $("anim-output"),
   micNodes: [
     $("mic-node-0"),
     $("mic-node-1"),
@@ -85,6 +98,7 @@ const D = {
   encPos:   [0,1,2,3].map(i => $(`enc-pos-${i}`)),
   encDelta: [0,1,2,3].map(i => $(`enc-delta-${i}`)),
   encMoving:[0,1,2,3].map(i => $(`enc-moving-${i}`)),
+  btnZeroEncoders: $("btn-zero-encoders"),
   // position control
   gotoLiftTicks: $("goto-lift-ticks"),
   gotoHeadTicks: $("goto-head-ticks"),
@@ -103,8 +117,38 @@ const D = {
   btnCamStop:  $("btn-cam-stop"),
   btnCamStreamOn: $("btn-cam-stream-on"),
   btnCamSnapshot: $("btn-cam-snapshot"),
+  dashHost: $("dash-host"),
+  dashUpdated: $("dash-updated"),
+  dashHealthScore: $("dash-health-score"),
+  dashHealthLabel: $("dash-health-label"),
+  dashHealthDetail: $("dash-health-detail"),
+  dashHealthStrip: document.querySelector(".health-strip"),
+  btnDashRefresh: $("btn-dash-refresh"),
+  btnDashPython: $("btn-dash-python"),
+  btnDashStop: $("btn-dash-stop"),
+  dashMotor: [0, 1, 2, 3].map(i => $(`dash-motor-${i}`)),
+  dashCards: {
+    api: { card: $("dash-card-api"), state: $("dash-api-state"), value: $("dash-api-value"), meta: $("dash-api-meta") },
+    spine: { card: $("dash-card-spine"), state: $("dash-spine-state"), value: $("dash-spine-value"), meta: $("dash-spine-meta") },
+    battery: { card: $("dash-card-battery"), state: $("dash-battery-state"), value: $("dash-battery-value"), meta: $("dash-battery-meta") },
+    motors: { card: $("dash-card-motors"), state: $("dash-motors-state"), value: $("dash-motors-value"), meta: $("dash-motors-meta") },
+    display: { card: $("dash-card-display"), state: $("dash-display-state"), value: $("dash-display-value"), meta: $("dash-display-meta") },
+    camera: { card: $("dash-card-camera"), state: $("dash-camera-state"), value: $("dash-camera-value"), meta: $("dash-camera-meta") },
+    audio: { card: $("dash-card-audio"), state: $("dash-audio-state"), value: $("dash-audio-value"), meta: $("dash-audio-meta") },
+    python: { card: $("dash-card-python"), state: $("dash-python-state"), value: $("dash-python-value"), meta: $("dash-python-meta") },
+    sensors: { card: $("dash-card-sensors"), state: $("dash-sensors-state"), value: $("dash-sensors-value"), meta: $("dash-sensors-meta") },
+  },
   log: $("log"),
+  devScriptEditor: $("dev-script-editor"),
+  devScriptFile: $("dev-script-file"),
+  btnDevRun: $("btn-dev-run"),
+  btnDevStop: $("btn-dev-stop"),
+  devConsole: $("dev-console"),
 };
+
+let animationItems = [];
+let selectedAnimation = null;
+let animationAbortController = null;
 
 // ── Logging ────────────────────────────────────────────────────────────────
 function log(tag, msg) {
@@ -172,29 +216,29 @@ function connect() {
     }
     if (msg.type === "audio_chunk") {
       if (!micStreamActive) return;
-      
+
       const binaryString = atob(msg.data);
       const len = binaryString.length;
       const bytes = new Uint8Array(len);
       for (let i = 0; i < len; i++) {
         bytes[i] = binaryString.charCodeAt(i);
       }
-      
+
       const int16Samples = new Int16Array(bytes.buffer);
       const float32Samples = new Float32Array(int16Samples.length);
       for (let i = 0; i < int16Samples.length; i++) {
         float32Samples[i] = int16Samples[i] / 32768.0;
       }
-      
+
       playMicChunk(float32Samples);
-      
+
       if (micRecordingActive) {
         recordedSamples.push(...float32Samples);
       }
-      
+
       const energies = msg.energies || [0, 0, 0, 0];
       const selectedCh = msg.selectedChannel ?? 0;
-      
+
       for (let i = 0; i < 4; i++) {
         const energy = energies[i];
         const active = i === selectedCh;
@@ -212,7 +256,7 @@ function connect() {
           }
         }
       }
-      
+
       const angles = [-45, 45, 135, -135];
       if (D.beamArrow) {
         D.beamArrow.style.transform = `translate(-50%, -100%) rotate(${angles[selectedCh]}deg)`;
@@ -252,6 +296,177 @@ function setStatus(state) {
   D.dot.className = "dot " + s.dot;
   D.label.textContent = s.label;
   D.btnConn.disabled = state === "connecting";
+}
+
+// ── Dashboard ─────────────────────────────────────────────────────────────
+function dashSet(key, level, state, value, meta) {
+  const d = D.dashCards?.[key];
+  if (!d?.card) return;
+  d.card.classList.remove("ok", "warn", "bad");
+  if (level) d.card.classList.add(level);
+  if (d.state) d.state.textContent = state;
+  if (d.value) d.value.textContent = value;
+  if (d.meta) d.meta.textContent = meta;
+}
+
+function dashHealth(level, score, label, detail) {
+  if (D.dashHealthStrip) {
+    D.dashHealthStrip.classList.remove("ok", "warn", "bad");
+    if (level) D.dashHealthStrip.classList.add(level);
+  }
+  if (D.dashHealthScore) D.dashHealthScore.textContent = score;
+  if (D.dashHealthLabel) D.dashHealthLabel.textContent = label;
+  if (D.dashHealthDetail) D.dashHealthDetail.textContent = detail;
+}
+
+function dashTime() {
+  return new Date().toLocaleTimeString([], { hour12: false });
+}
+
+function estBatteryVoltage(raw) {
+  if (!Number.isFinite(raw)) return "--";
+  return (raw / 826).toFixed(2) + " V";
+}
+
+function updateDashboardFromStatus(status, motorState = null, audioStatus = null, capabilities = null) {
+  S.lastStatus = status;
+  S.lastDashboardRefresh = Date.now();
+  const ip = D.ip.value.trim();
+  if (D.dashHost) D.dashHost.textContent = `${ip || "--"}:8080`;
+  if (D.dashUpdated) D.dashUpdated.textContent = `updated ${dashTime()}`;
+
+  const issues = [];
+  const warnings = [];
+
+  const apiVersion = status?.api_version || "--";
+  dashSet("api", apiVersion === "--" ? "bad" : "ok", apiVersion === "--" ? "MISS" : "OK", apiVersion, capabilities ? `${capabilities.endpoints?.length || 0} endpoints advertised` : "capabilities checked");
+  if (apiVersion === "--") issues.push("API unavailable");
+
+  const spineOk = !!status?.spine?.connected;
+  dashSet("spine", spineOk ? "ok" : "bad", spineOk ? "OK" : "DOWN", spineOk ? "connected" : "not connected", status?.spine?.device || "/dev/ttyHS0");
+  if (!spineOk) issues.push("Spine MCU disconnected");
+
+  const battery = status?.body?.battery;
+  const rawV = Number(battery?.main_voltage_raw);
+  const volts = estBatteryVoltage(rawV);
+  const temp = battery?.temperature_raw == null ? "--" : `${battery.temperature_raw} C`;
+  const batteryLevel = Number.isFinite(rawV) && rawV < 2500 ? "warn" : "ok";
+  dashSet("battery", batteryLevel, Number.isFinite(rawV) && rawV < 2500 ? "LOW" : "OK", volts, `raw ${rawV || "--"}, temp ${temp}, flags ${battery?.flags ?? "--"}`);
+  if (batteryLevel === "warn") warnings.push("battery low");
+
+  const motors = motorState?.motors || motorState?.motor || status?.body?.motors || [];
+  const moving = motors.filter(m => m.moving || Number(m.delta) !== 0);
+  const motorLevel = motors.length >= 4 ? "ok" : "warn";
+  dashSet("motors", motorLevel, moving.length ? "MOVING" : "IDLE", `${motors.length || 0}/4 online`, moving.length ? `${moving.map(m => m.name || m.id).join(", ")}` : "all deltas settled");
+  if (motors.length < 4) warnings.push("motor telemetry incomplete");
+  motors.slice(0, 4).forEach((m, i) => {
+    if (D.dashMotor?.[i]) D.dashMotor[i].textContent = `${Number(m.position || 0).toLocaleString()}  Δ${Number(m.delta || 0) >= 0 ? "+" : ""}${Number(m.delta || 0)}`;
+  });
+
+  const display = status?.display;
+  const displayPresent = !!display?.present;
+  const displayLevel = displayPresent ? (display.initialized ? "ok" : "warn") : "bad";
+  dashSet("display", displayLevel, displayPresent ? (display.initialized ? "INIT" : "READY") : "MISS", `${display?.width || "--"}x${display?.height || "--"}`, `${display?.panel || "unknown"} ${display?.format || ""}`.trim());
+  if (!displayPresent) issues.push("display SPI missing");
+  else if (!display.initialized) warnings.push("display not initialized");
+
+  const camera = status?.camera;
+  const cameraOk = !!camera?.daemon_running;
+  dashSet("camera", cameraOk ? "ok" : "warn", cameraOk ? "RUN" : "IDLE", cameraOk ? `pid ${camera.daemon_pid}` : "daemon stopped", camera?.snapshot_available ? "snapshot cached" : "no snapshot cache");
+  if (!cameraOk) warnings.push("camera daemon stopped");
+
+  const audio = audioStatus || status?.audio;
+  const audioOk = !!audio?.available;
+  dashSet("audio", audioOk ? "ok" : "bad", audioOk ? "OK" : "MISS", audio?.player || "aplay", audio?.volume == null ? (audio?.upload_path || "--") : `volume ${audio.volume}%`);
+  if (!audioOk) issues.push("audio unavailable");
+
+  const body = status?.body || {};
+  const prox = body.proximity || {};
+  const cliff = Array.isArray(body.cliff) ? body.cliff : [];
+  const touch = Array.isArray(body.touch) ? body.touch : [];
+  const cliffHazards = cliff.filter(v => Number(v) < CLIFF_HAZARD).length;
+  const proxLevel = prox.status === 0 || prox.range_mm < 8190 ? "ok" : "warn";
+  const sensorLevel = cliffHazards ? "bad" : proxLevel;
+  const powerPressed = !!(body.buttons?.power ?? body.buttons?.back);
+  dashSet("sensors", sensorLevel, cliffHazards ? "CLIFF" : "OK", `tof ${prox.range_mm ?? "--"} mm`, `cliff ${cliff.join("/") || "--"}, touch ${touch[0] ?? "--"}, power ${powerPressed ? "down" : "up"}`);
+  if (cliffHazards) issues.push("cliff sensor hazard");
+  if (proxLevel === "warn") warnings.push("TOF reports out of range");
+
+  const pythonCard = D.dashCards?.python?.card;
+  if (pythonCard && !pythonCard.dataset.checked) {
+    dashSet("python", "warn", "UNCHECKED", "not tested", "run Python check");
+  }
+
+  const okCount = [...document.querySelectorAll(".dash-card.ok")].length;
+  const badCount = [...document.querySelectorAll(".dash-card.bad")].length;
+  const warnCount = [...document.querySelectorAll(".dash-card.warn")].length;
+  const score = Math.max(0, Math.round((okCount / Math.max(1, okCount + warnCount + badCount)) * 100));
+  if (issues.length) {
+    dashHealth("bad", `${score}%`, "ATTENTION", issues.concat(warnings).slice(0, 4).join(" · "));
+  } else if (warnings.length) {
+    dashHealth("warn", `${score}%`, "PARTIAL", warnings.slice(0, 4).join(" · "));
+  } else {
+    dashHealth("ok", `${score}%`, "READY", "Core hardware services are reachable.");
+  }
+}
+
+async function refreshDashboard({ quiet = false } = {}) {
+  const ip = D.ip.value.trim();
+  if (D.dashHost) D.dashHost.textContent = `${ip || "--"}:8080`;
+  if (!quiet) log("INFO", "Refreshing robot status dashboard.");
+  try {
+    const [statusRes, motorsRes, audioRes, capsRes] = await Promise.allSettled([
+      robotFetch("/status"),
+      robotFetch("/motors/state"),
+      robotFetch("/audio/status"),
+      robotFetch("/capabilities"),
+    ]);
+    if (statusRes.status !== "fulfilled" || !statusRes.value.ok) {
+      const detail = statusRes.status === "fulfilled" ? await statusRes.value.text() : statusRes.reason?.message;
+      throw new Error(detail || "status request failed");
+    }
+    const status = await statusRes.value.json();
+    const motorState = motorsRes.status === "fulfilled" && motorsRes.value.ok ? await motorsRes.value.json() : null;
+    const audioStatus = audioRes.status === "fulfilled" && audioRes.value.ok ? await audioRes.value.json() : null;
+    const capabilities = capsRes.status === "fulfilled" && capsRes.value.ok ? await capsRes.value.json() : null;
+    updateDashboardFromStatus(status, motorState, audioStatus, capabilities);
+  } catch (e) {
+    dashHealth("bad", "0%", "OFFLINE", e.message);
+    ["api", "spine", "battery", "motors", "display", "camera", "audio", "sensors"].forEach(key => {
+      dashSet(key, "bad", "MISS", "--", "robot unreachable");
+    });
+  }
+}
+
+async function runDashboardPythonCheck() {
+  const d = D.dashCards?.python;
+  if (d?.card) d.card.dataset.checked = "1";
+  dashSet("python", "warn", "RUNNING", "checking", "uploading script");
+  try {
+    const code = [
+      "from vector_robot import VectorRobot",
+      "robot = VectorRobot()",
+      "print('api', robot.status()['api_version'])",
+      "print('motors', len(robot.motors_state()['motors']))",
+      "robot.stop_motors()",
+      "",
+    ].join("\n");
+    const res = await robotFetch("/apps/run-script", {
+      method: "POST",
+      headers: { "Content-Type": "text/plain" },
+      body: code,
+    });
+    const text = await res.text();
+    if (!res.ok) throw new Error(text);
+    const clean = text.trim().replace(/\s+/g, " ");
+    dashSet("python", "ok", "OK", "script ran", clean || "completed");
+    log("OK", `Python runner check: ${clean || "completed"}`);
+  } catch (e) {
+    dashSet("python", "bad", "FAIL", "script failed", e.message);
+    log("ERROR", `Python runner check failed: ${e.message}`);
+  } finally {
+    refreshDashboard({ quiet: true }).catch(() => {});
+  }
 }
 
 // ── Telemetry watchdog — shows if data is arriving independently of motors ──
@@ -348,11 +563,19 @@ function onTelemetry(d) {
     D.vt0.title = touched ? "TOUCHED" : "idle";
   }
 
+  if (D.vBackBtn && d.buttons) {
+    const pressed = !!(d.buttons.power ?? d.buttons.back);
+    const holdMs = Number(d.buttons.power_hold_ms || 0);
+    D.vBackBtn.textContent = pressed && holdMs > 0 ? `DOWN ${Math.round(holdMs / 100) / 10}s` : (pressed ? "DOWN" : "UP");
+    D.vBackBtn.style.color = pressed ? "var(--green)" : "var(--cyan)";
+    D.vBackBtn.title = pressed ? "pressed" : "idle";
+  }
+
   // Proximity (TOF)
   if (d.proximity) {
     const range = d.proximity.range_mm;
     const status = d.proximity.status;
-    
+
     if (range === 8190 || range === 8191) {
       D.vproxDist.textContent = "Out of Range";
       D.vproxDist.style.color = "var(--cyan)";
@@ -360,7 +583,7 @@ function onTelemetry(d) {
       D.vproxDist.textContent = range + " mm";
       D.vproxDist.style.color = "var(--green)";
     }
-    
+
     const statuses = {
       0: "Valid",
       1: "Sigma Fail",
@@ -401,7 +624,15 @@ function onMotorState(data) {
 function renderMotorState(motors) {
   motors.forEach((m, i) => {
     if (Number.isFinite(m.position)) latestMotorPos[i] = m.position;
-    if (D.encPos[i])   D.encPos[i].textContent   = m.position.toLocaleString();
+    if (encoderZero[i] == null && Number.isFinite(m.position)) encoderZero[i] = m.position;
+    const raw = Number(m.position || 0);
+    const rel = raw - (encoderZero[i] ?? raw);
+    const forward = TRACK_FORWARD_SIGN[i] * rel;
+    const label = i <= 1 ? "FWD" : "REL";
+    if (D.encPos[i]) {
+      D.encPos[i].textContent = `${label} ${signedTicks(forward)}`;
+      D.encPos[i].title = `raw ${raw.toLocaleString()}, relative ${signedTicks(rel)}`;
+    }
     if (D.encDelta[i]) D.encDelta[i].textContent = `Δ${m.delta > 0 ? '+' : ''}${m.delta}`;
     if (D.encMoving[i]) {
       D.encMoving[i].classList.toggle('active', m.moving ?? m.delta !== 0);
@@ -413,6 +644,20 @@ function renderMotorState(motors) {
 const holdState = { lift: false, head: false };
 const holdTargetPos = { lift: null, head: null };
 const latestMotorPos = [null, null, null, null];
+const encoderZero = [null, null, null, null];
+const TRACK_FORWARD_SIGN = [1, -1, 1, 1];
+
+function signedTicks(v) {
+  const n = Number(v || 0);
+  return `${n >= 0 ? "+" : ""}${Math.trunc(n).toLocaleString()}`;
+}
+
+function zeroEncoderView() {
+  latestMotorPos.forEach((pos, i) => {
+    if (Number.isFinite(pos)) encoderZero[i] = pos;
+  });
+  log("INFO", "Encoder view zeroed.");
+}
 
 async function postMotorPosition(motor, ticks, power) {
   const r = await robotFetch("/motors/position", {
@@ -767,10 +1012,10 @@ function stopVideoStream({ cancelAudio = false, releaseUrl = false } = {}) {
   videoTimer = null;
   D.videoToggle.textContent = "PLAY VIDEO";
   if (!D.videoSource.paused) D.videoSource.pause();
-  
+
   // Stop high-speed display stream on WebSocket
   sendWs({ type: "display_stream_stop" });
-  
+
   if (cancelAudio) {
     audioPlayToken++;
     robotFetch("/audio/stop", { method: "POST" }).catch(() => {});
@@ -800,10 +1045,10 @@ D.videoToggle.addEventListener("click", async () => {
   D.videoSource.currentTime = 0;
   await D.videoSource.play();
   D.videoToggle.textContent = "STOP VIDEO";
-  
+
   // Start high-speed display stream on WebSocket
   sendWs({ type: "display_stream_start" });
-  
+
   videoTimer = setInterval(() => {
     drawVideoToFace();
     const frame = rgb565FromPreview();
@@ -1327,11 +1572,11 @@ function playMicChunk(floatSamples) {
   if (!micAudioCtx) return;
   const buffer = micMicContextBuffer(floatSamples);
   if (!buffer) return;
-  
+
   const source = micAudioCtx.createBufferSource();
   source.buffer = buffer;
   source.connect(micAudioCtx.destination);
-  
+
   const currentTime = micAudioCtx.currentTime;
   if (micNextPlayTime < currentTime) {
     micNextPlayTime = currentTime + 0.04;
@@ -1354,12 +1599,12 @@ function toggleMicStream() {
     D.btnMicToggle.className = "btn primary";
     D.vmicStatus.textContent = "OFFLINE";
     D.vmicStatus.className = "val";
-    
+
     if (micRecordingActive) {
       toggleMicRecord();
     }
     D.btnMicRecord.disabled = true;
-    
+
     if (S.ws && S.ws.readyState === WebSocket.OPEN) {
       S.ws.send(JSON.stringify({ type: "mic_stop" }));
     }
@@ -1375,11 +1620,11 @@ function toggleMicStream() {
     D.vmicStatus.textContent = "LISTENING";
     D.vmicStatus.className = "val ok";
     D.btnMicRecord.disabled = false;
-    
+
     const AudioContextCtor = window.AudioContext || window.webkitAudioContext;
     micAudioCtx = new AudioContextCtor();
     micNextPlayTime = micAudioCtx.currentTime;
-    
+
     if (S.ws && S.ws.readyState === WebSocket.OPEN) {
       S.ws.send(JSON.stringify({ type: "mic_start" }));
     }
@@ -1392,7 +1637,7 @@ function toggleMicRecord() {
     micRecordingActive = false;
     D.btnMicRecord.textContent = "RECORD";
     D.btnMicRecord.className = "btn danger";
-    
+
     if (recordedSamples.length > 0) {
       try {
         const wav = encodeWavPcm16(recordedSamples, MIC_SAMPLE_RATE);
@@ -1431,6 +1676,11 @@ function initTabs() {
       btn.classList.add("active");
       const pane = document.getElementById(btn.dataset.tab);
       if (pane) pane.classList.add("active");
+      if (btn.dataset.tab === "tab-status") {
+        refreshDashboard({ quiet: true }).catch(() => {});
+      } else if (btn.dataset.tab === "tab-animations" && animationItems.length === 0) {
+        fetchAnimations().catch(() => {});
+      }
     });
   });
 }
@@ -1448,13 +1698,13 @@ async function fetchVideos() {
     const res = await robotFetch("/videos");
     if (!res.ok) throw new Error(await res.text());
     const list = await res.json();
-    
+
     D.vvidListContainer.innerHTML = "";
     if (list.length === 0) {
       D.vvidListContainer.innerHTML = `<div style="color:var(--cyan);font-size:11px;padding:6px;text-align:center">No videos found on robot.</div>`;
       return;
     }
-    
+
     list.forEach(name => {
       const row = document.createElement("div");
       row.className = "enc-row";
@@ -1462,7 +1712,7 @@ async function fetchVideos() {
       row.style.gap = "8px";
       row.style.alignItems = "center";
       row.style.padding = "4px 8px";
-      
+
       row.innerHTML = `
         <span class="enc-name" style="text-overflow:ellipsis; overflow:hidden; white-space:nowrap; text-align:left;" title="${name}">${name}</span>
         <button class="btn-sm" style="font-size:9px;padding:2px 8px;background:var(--green);border-color:var(--green)" onclick="playRobotVideo('${name}')">PLAY</button>
@@ -1513,6 +1763,180 @@ async function stopRobotVideo() {
   }
 }
 
+// ── DDL Animation Browser ─────────────────────────────────────────────────
+function trackLabel(tracks = {}) {
+  const labels = [];
+  const map = [
+    ["HeadAngleKeyFrame", "head"],
+    ["LiftHeightKeyFrame", "lift"],
+    ["BodyMotionKeyFrame", "body"],
+    ["ProceduralFaceKeyFrame", "face"],
+    ["FaceAnimationKeyFrame", "sprites"],
+    ["BackpackLightsKeyFrame", "leds"],
+    ["RobotAudioKeyFrame", "audio"],
+  ];
+  for (const [key, label] of map) {
+    if (tracks[key]) labels.push(`${label}:${tracks[key]}`);
+  }
+  return labels;
+}
+
+function itemBadges(item) {
+  if (item.type === "group") {
+    const count = item.clip_count || item.clips?.length || 0;
+    return [
+      `<span class="anim-badge group">group</span>`,
+      `<span class="anim-badge">${count} clips</span>`,
+      `<span class="anim-badge">weight:${Math.round((item.total_weight || 0) * 10) / 10}</span>`,
+    ].join("");
+  }
+  const badges = trackLabel(item.tracks).slice(0, 5).map(x => `<span class="anim-badge">${x}</span>`).join("");
+  return `<span class="anim-badge clip">clip</span><span class="anim-badge">${Math.round((item.duration_ms || 0) / 100) / 10}s</span>${badges}`;
+}
+
+function renderAnimationList() {
+  if (!D.animList) return;
+  const q = (D.animFilter?.value || "").trim().toLowerCase();
+  const filtered = animationItems.filter(item =>
+    !q ||
+    item.name.toLowerCase().includes(q) ||
+    item.path.toLowerCase().includes(q) ||
+    (item.group || "").toLowerCase().includes(q) ||
+    (item.clips || []).some(name => name.toLowerCase().includes(q))
+  );
+
+  D.animList.innerHTML = "";
+  if (D.animCount) D.animCount.textContent = `${filtered.length}/${animationItems.length} items`;
+  if (filtered.length === 0) {
+    D.animList.innerHTML = `<div class="anim-empty">No matching animations.</div>`;
+    return;
+  }
+
+  for (const item of filtered.slice(0, 400)) {
+    const row = document.createElement("button");
+    row.type = "button";
+    row.className = `anim-row${selectedAnimation?.name === item.name && selectedAnimation?.type === item.type ? " active" : ""}`;
+    const detail = item.type === "group"
+      ? `${item.path} -> ${(item.clips || []).slice(0, 4).join(", ")}${(item.clips || []).length > 4 ? ", ..." : ""}`
+      : item.path;
+    row.innerHTML = `
+      <div class="anim-main">
+        <div class="anim-name" title="${item.name}">${item.name}</div>
+        <div class="anim-path" title="${detail}">${detail}</div>
+      </div>
+      <div class="anim-badges">
+        ${itemBadges(item)}
+      </div>
+    `;
+    row.addEventListener("click", () => {
+      selectedAnimation = item;
+      if (D.animSelected) D.animSelected.textContent = `${item.type || "clip"}: ${item.name}`;
+      if (D.btnAnimPlay) D.btnAnimPlay.disabled = false;
+      renderAnimationList();
+    });
+    D.animList.appendChild(row);
+  }
+  if (filtered.length > 400) {
+    const more = document.createElement("div");
+    more.className = "anim-empty";
+    more.textContent = `Showing first 400 of ${filtered.length}. Use filter to narrow.`;
+    D.animList.appendChild(more);
+  }
+}
+
+async function fetchAnimations() {
+  if (!D.animList) return;
+  D.animList.innerHTML = `<div class="anim-empty">Loading animations...</div>`;
+  if (D.animStatus) D.animStatus.textContent = "LOADING";
+  try {
+    const res = await fetch("/local/animations", { cache: "no-store" });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || res.statusText);
+    const clips = (data.animations || []).map(item => ({ ...item, type: item.type || "clip" }));
+    const groups = (data.groups || []).map(item => ({ ...item, type: item.type || "group" }));
+    animationItems = [...groups, ...clips];
+    selectedAnimation = null;
+    if (D.animRoot) D.animRoot.textContent = `root: ${data.root || "--"}`;
+    if (D.animSelected) D.animSelected.textContent = "--";
+    if (D.btnAnimPlay) D.btnAnimPlay.disabled = true;
+    if (D.animStatus) D.animStatus.textContent = "READY";
+    renderAnimationList();
+    log("OK", `Loaded ${clips.length} DDL clips and ${groups.length} groups.`);
+  } catch (e) {
+    animationItems = [];
+    if (D.animRoot) D.animRoot.textContent = "root: unavailable";
+    if (D.animStatus) D.animStatus.textContent = "ERROR";
+    D.animList.innerHTML = `<div class="anim-empty">Animation load failed: ${e.message}</div>`;
+    log("ERROR", `Failed to load animations: ${e.message}`);
+  }
+}
+
+async function playSelectedAnimation() {
+  if (!selectedAnimation) {
+    log("WARN", "Select an animation first.");
+    return;
+  }
+  const ip = D.ip.value.trim();
+  animationAbortController = new AbortController();
+  if (D.btnAnimPlay) D.btnAnimPlay.disabled = true;
+  if (D.animStatus) D.animStatus.textContent = "PLAYING";
+  if (D.animOutput) D.animOutput.textContent = `Starting ${selectedAnimation.type || "clip"} ${selectedAnimation.name}...\n`;
+  try {
+    const res = await fetch("/local/animations/play", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-robot-ip": ip,
+      },
+      body: JSON.stringify({ name: selectedAnimation.name, type: selectedAnimation.type || "clip" }),
+      signal: animationAbortController.signal,
+    });
+    if (!res.ok) {
+      const text = await res.text();
+      throw new Error(text);
+    }
+    if (!res.body) {
+      if (D.animOutput) D.animOutput.textContent += "No output stream.\n";
+      return;
+    }
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      const text = decoder.decode(value);
+      if (D.animOutput) {
+        D.animOutput.textContent += text;
+        D.animOutput.scrollTop = D.animOutput.scrollHeight;
+      }
+    }
+    if (D.animStatus) D.animStatus.textContent = "DONE";
+    log("OK", `Animation finished: ${selectedAnimation.name}`);
+  } catch (e) {
+    if (e.name === "AbortError") {
+      if (D.animStatus) D.animStatus.textContent = "STOPPED";
+      if (D.animOutput) D.animOutput.textContent += "\n[playback stopped]\n";
+      log("INFO", "Animation playback stopped.");
+    } else {
+      if (D.animStatus) D.animStatus.textContent = "ERROR";
+      if (D.animOutput) D.animOutput.textContent += `\nError: ${e.message}\n`;
+      log("ERROR", `Animation failed: ${e.message}`);
+    }
+  } finally {
+    if (D.btnAnimPlay) D.btnAnimPlay.disabled = !selectedAnimation;
+    animationAbortController = null;
+  }
+}
+
+async function stopSelectedAnimation() {
+  if (animationAbortController) animationAbortController.abort();
+  try {
+    const ip = D.ip.value.trim();
+    await fetch("/local/animations/stop", { method: "POST", headers: { "x-robot-ip": ip } });
+  } catch (_) {}
+  if (D.animStatus) D.animStatus.textContent = "STOPPED";
+}
+
 async function prepareAudioForVvid(file) {
   const samples = await decodeAudioFileToMono(file).catch(err => {
     log("WARN", `Audio extraction failed, creating silent track: ${err.message}`);
@@ -1528,35 +1952,35 @@ async function extractVideoFrames(file, fps) {
     video.playsInline = true;
     const url = URL.createObjectURL(file);
     video.src = url;
-    
+
     video.onloadedmetadata = async () => {
       try {
         const duration = video.duration;
         const totalFrames = Math.floor(duration * fps);
         const frames = [];
-        
+
         const canvas = document.createElement("canvas");
         canvas.width = 184;
         canvas.height = 96;
         const ctx = canvas.getContext("2d");
-        
+
         for (let i = 0; i < totalFrames; i++) {
           const time = i / fps;
           video.currentTime = time;
-          
+
           await new Promise((res, rej) => {
             video.onseeked = res;
             video.onerror = rej;
             setTimeout(() => rej(new Error("Seek timeout")), 5000);
           });
-          
+
           ctx.fillStyle = "#000";
           ctx.fillRect(0, 0, 184, 96);
           const scale = Math.min(184 / video.videoWidth, 96 / video.videoHeight);
           const w = Math.max(1, Math.round(video.videoWidth * scale));
           const h = Math.max(1, Math.round(video.videoHeight * scale));
           ctx.drawImage(video, Math.floor((184 - w) / 2), Math.floor((96 - h) / 2), w, h);
-          
+
           const img = ctx.getImageData(0, 0, 184, 96).data;
           const rgb565 = new Uint8Array(184 * 96 * 2);
           for (let p = 0, q = 0; p < img.length; p += 4, q += 2) {
@@ -1568,10 +1992,10 @@ async function extractVideoFrames(file, fps) {
             rgb565[q + 1] = v >> 8;
           }
           frames.push(rgb565);
-          
+
           setVvidUploadStatus(`EXTRACTING FRAMES: ${Math.round((i / totalFrames) * 100)}%`);
         }
-        
+
         URL.revokeObjectURL(url);
         resolve(frames);
       } catch (err) {
@@ -1579,7 +2003,7 @@ async function extractVideoFrames(file, fps) {
         reject(err);
       }
     };
-    
+
     video.onerror = (e) => {
       URL.revokeObjectURL(url);
       reject(new Error("Failed to load video metadata"));
@@ -1594,60 +2018,60 @@ function compileVvid(wavBytes, frames, fps) {
   const audioBytes = wavBytes.byteLength;
   const headerSize = 24;
   const videoOffset = headerSize + audioBytes;
-  
+
   const totalSize = videoOffset + frameCount * 184 * 96 * 2;
   const buffer = new ArrayBuffer(totalSize);
   const view = new DataView(buffer);
-  
+
   for (let i = 0; i < 4; i++) view.setUint8(i, magic[i]);
   view.setUint32(4, version, true);
   view.setUint32(8, fps, true);
   view.setUint32(12, frameCount, true);
   view.setUint32(16, audioBytes, true);
   view.setUint32(20, videoOffset, true);
-  
+
   const u8Buffer = new Uint8Array(buffer);
   u8Buffer.set(wavBytes, headerSize);
-  
+
   let offset = videoOffset;
   const frameSize = 184 * 96 * 2;
   for (let i = 0; i < frameCount; i++) {
     u8Buffer.set(frames[i], offset);
     offset += frameSize;
   }
-  
+
   return buffer;
 }
 
 async function convertAndUploadVideo(file) {
   setVvidUploadStatus("DECODING AUDIO...");
   log("INFO", "Decoding video audio track...");
-  
+
   try {
     const wavBytes = await prepareAudioForVvid(file);
     setVvidUploadStatus("EXTRACTING VIDEO FRAMES...");
     log("INFO", "Extracting video frames at 30 FPS...");
-    
+
     const frames = await extractVideoFrames(file, 30);
     setVvidUploadStatus("COMPILING VVID FILE...");
     log("INFO", `Compiling VVID container (${frames.length} frames)...`);
-    
+
     const vvidBuffer = compileVvid(wavBytes, frames, 30);
-    
+
     setVvidUploadStatus("UPLOADING TO ROBOT...");
     log("INFO", `Uploading VVID to robot (${Math.round(vvidBuffer.byteLength / 1024)} KiB)...`);
-    
+
     const baseName = file.name.substring(0, file.name.lastIndexOf('.')) || file.name;
     const vvidName = baseName.replace(/[^a-zA-Z0-9_-]/g, "_") + ".vvid";
-    
+
     const res = await robotFetch(`/videos/upload?name=${vvidName}`, {
       method: "POST",
       headers: { "Content-Type": "application/octet-stream" },
       body: vvidBuffer
     });
-    
+
     if (!res.ok) throw new Error(await res.text());
-    
+
     setVvidUploadStatus("UPLOAD SUCCESS", "ok");
     log("OK", `Video uploaded successfully: ${vvidName}`);
     await fetchVideos();
@@ -1661,9 +2085,24 @@ async function convertAndUploadVideo(file) {
 }
 
 // ── Init ───────────────────────────────────────────────────────────────────
-window.addEventListener("load", () => {
+window.addEventListener("load", async () => {
   const saved = localStorage.getItem("vec-ip");
-  if (saved) D.ip.value = saved;
+  try {
+    const cfgRes = await fetch("/api/config", { cache: "no-store" });
+    if (cfgRes.ok) {
+      const cfg = await cfgRes.json();
+      if (cfg.ip) {
+        D.ip.value = cfg.ip;
+        localStorage.setItem("vec-ip", cfg.ip);
+      } else if (saved) {
+        D.ip.value = saved;
+      }
+    } else if (saved) {
+      D.ip.value = saved;
+    }
+  } catch (_) {
+    if (saved) D.ip.value = saved;
+  }
   const faceCtx = D.facePreview.getContext("2d");
   faceCtx.fillStyle = "#000";
   faceCtx.fillRect(0, 0, FACE_W, FACE_H);
@@ -1671,9 +2110,28 @@ window.addEventListener("load", () => {
   D.ledPrev.style.boxShadow  = `0 0 14px ${D.ledColor.value}88`;
 
   initTabs();
+  refreshDashboard({ quiet: true }).catch(() => {});
+  if (!S.dashboardTimer) {
+    S.dashboardTimer = setInterval(() => {
+      const statusTab = document.getElementById("tab-status");
+      if (statusTab?.classList.contains("active")) {
+        refreshDashboard({ quiet: true }).catch(() => {});
+      }
+    }, 5000);
+  }
 
   if (D.btnMicToggle) D.btnMicToggle.addEventListener("click", toggleMicStream);
   if (D.btnMicRecord) D.btnMicRecord.addEventListener("click", toggleMicRecord);
+  if (D.btnDashRefresh) D.btnDashRefresh.addEventListener("click", () => refreshDashboard());
+  if (D.btnDashPython) D.btnDashPython.addEventListener("click", runDashboardPythonCheck);
+  if (D.btnDashStop) D.btnDashStop.addEventListener("click", () => {
+    stopMotors()
+      .then(() => {
+        log("INFO", "Dashboard stop sent.");
+        refreshDashboard({ quiet: true }).catch(() => {});
+      })
+      .catch(e => log("WARN", `Dashboard stop failed: ${e.message}`));
+  });
 
   // Position control buttons
   if (D.btnGotoLift)   D.btnGotoLift.addEventListener("click",  () => gotoMotor(2, D.gotoLiftTicks));
@@ -1693,6 +2151,7 @@ window.addEventListener("load", () => {
     sendMotors();
     log("INFO", "All motors stopped.");
   });
+  if (D.btnZeroEncoders) D.btnZeroEncoders.addEventListener("click", zeroEncoderView);
 
   // Video controls
   if (D.btnVvidRefresh) D.btnVvidRefresh.addEventListener("click", fetchVideos);
@@ -1710,6 +2169,96 @@ window.addEventListener("load", () => {
         D.btnVvidUpload.disabled = true;
         D.vvidFileInput.disabled = true;
         convertAndUploadVideo(file);
+      }
+    });
+  }
+  if (D.btnAnimRefresh) D.btnAnimRefresh.addEventListener("click", fetchAnimations);
+  if (D.animFilter) D.animFilter.addEventListener("input", renderAnimationList);
+  if (D.btnAnimPlay) D.btnAnimPlay.addEventListener("click", playSelectedAnimation);
+  if (D.btnAnimStop) D.btnAnimStop.addEventListener("click", stopSelectedAnimation);
+
+  // ── Developer Console Handlers ──────────────────────────────────────────────
+  let scriptAbortController = null;
+
+  async function runScript() {
+    const code = D.devScriptEditor.value;
+    const ip = D.ip.value.trim();
+
+    if (D.btnDevRun) D.btnDevRun.disabled = true;
+    if (D.btnDevStop) D.btnDevStop.disabled = false;
+    if (D.devConsole) D.devConsole.textContent = "Uploading and starting script on the robot...\n";
+
+    scriptAbortController = new AbortController();
+
+    try {
+      const res = await fetch(`/api/apps/run-script`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "text/plain",
+          "x-robot-ip": ip
+        },
+        body: code,
+        signal: scriptAbortController.signal
+      });
+
+      if (!res.ok) {
+        const text = await res.text();
+        if (D.devConsole) D.devConsole.textContent += `Error starting script: ${text}\n`;
+        return;
+      }
+
+      if (!res.body) {
+        if (D.devConsole) D.devConsole.textContent += `Error: Empty response stream\n`;
+        return;
+      }
+
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) {
+          if (D.devConsole) D.devConsole.textContent += "\n[Script process completed]\n";
+          break;
+        }
+        const text = decoder.decode(value);
+        if (D.devConsole) {
+          D.devConsole.textContent += text;
+          D.devConsole.scrollTop = D.devConsole.scrollHeight;
+        }
+      }
+    } catch (e) {
+      if (e.name === "AbortError") {
+        if (D.devConsole) D.devConsole.textContent += "\n[Script terminated by user]\n";
+      } else {
+        if (D.devConsole) D.devConsole.textContent += `Error: ${e.message}\n`;
+      }
+    } finally {
+      if (D.btnDevRun) D.btnDevRun.disabled = false;
+      if (D.btnDevStop) D.btnDevStop.disabled = true;
+      scriptAbortController = null;
+    }
+  }
+
+  function stopScript() {
+    if (scriptAbortController) {
+      scriptAbortController.abort();
+    }
+  }
+
+  if (D.btnDevRun) D.btnDevRun.addEventListener("click", runScript);
+  if (D.btnDevStop) D.btnDevStop.addEventListener("click", stopScript);
+  if (D.devScriptFile) {
+    D.devScriptFile.addEventListener("change", () => {
+      const file = D.devScriptFile.files?.[0];
+      if (file) {
+        const reader = new FileReader();
+        reader.onload = (e) => {
+          if (D.devScriptEditor) {
+            D.devScriptEditor.value = e.target.result;
+          }
+        };
+        reader.readAsText(file);
       }
     });
   }

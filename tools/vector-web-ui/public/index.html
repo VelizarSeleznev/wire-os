@@ -37,7 +37,7 @@
     </div>
   </div>
   <div class="top-bar-right">
-    <input type="text" id="robot-ip" value="192.168.1.89" placeholder="Robot IP" spellcheck="false" />
+    <input type="text" id="robot-ip" value="192.168.1.93" placeholder="Robot IP" spellcheck="false" />
     <button id="btn-connect" class="btn primary" onclick="toggleConnect()">CONNECT</button>
     <div class="battery-box" id="battery-box">
       <svg width="36" height="18" viewBox="0 0 36 18">
@@ -84,15 +84,97 @@
 
     <!-- Tab bar -->
     <div class="tab-bar">
-      <button class="tab-btn active" data-tab="tab-motors" id="tbtn-motors">MOTORS</button>
+      <button class="tab-btn active" data-tab="tab-status" id="tbtn-status">STATUS</button>
+      <button class="tab-btn" data-tab="tab-motors" id="tbtn-motors">MOTORS</button>
       <button class="tab-btn" data-tab="tab-camera" id="tbtn-camera">CAMERA</button>
       <button class="tab-btn" data-tab="tab-display" id="tbtn-display">DISPLAY</button>
       <button class="tab-btn" data-tab="tab-audio" id="tbtn-audio">AUDIO</button>
+      <button class="tab-btn" data-tab="tab-animations" id="tbtn-animations">ANIMATIONS</button>
       <button class="tab-btn" data-tab="tab-videos" id="tbtn-videos">VIDEOS</button>
+      <button class="tab-btn" data-tab="tab-developer" id="tbtn-developer">DEVELOPER</button>
+    </div>
+
+    <!-- ── Tab: STATUS ── -->
+    <div class="tab-pane active panel" id="tab-status">
+      <div class="dashboard-head">
+        <div>
+          <div class="panel-title">ROBOT STATUS</div>
+          <div class="dash-endpoint"><span id="dash-host">--</span><span id="dash-updated">--</span></div>
+        </div>
+        <div class="dash-actions">
+          <button class="btn" id="btn-dash-refresh">REFRESH</button>
+          <button class="btn" id="btn-dash-python">PYTHON CHECK</button>
+          <button class="btn danger" id="btn-dash-stop">STOP</button>
+        </div>
+      </div>
+
+      <div class="health-strip">
+        <div class="health-score" id="dash-health-score">--</div>
+        <div>
+          <div class="health-label" id="dash-health-label">NO DATA</div>
+          <div class="health-detail" id="dash-health-detail">Waiting for robot status.</div>
+        </div>
+      </div>
+
+      <div class="dash-grid">
+        <div class="dash-card" id="dash-card-api">
+          <div class="dash-card-head"><span>API</span><span class="dash-pill" id="dash-api-state">--</span></div>
+          <div class="dash-value" id="dash-api-value">--</div>
+          <div class="dash-meta" id="dash-api-meta">--</div>
+        </div>
+        <div class="dash-card" id="dash-card-spine">
+          <div class="dash-card-head"><span>SPINE MCU</span><span class="dash-pill" id="dash-spine-state">--</span></div>
+          <div class="dash-value" id="dash-spine-value">--</div>
+          <div class="dash-meta" id="dash-spine-meta">--</div>
+        </div>
+        <div class="dash-card" id="dash-card-battery">
+          <div class="dash-card-head"><span>BATTERY</span><span class="dash-pill" id="dash-battery-state">--</span></div>
+          <div class="dash-value" id="dash-battery-value">--</div>
+          <div class="dash-meta" id="dash-battery-meta">--</div>
+        </div>
+        <div class="dash-card" id="dash-card-motors">
+          <div class="dash-card-head"><span>MOTORS</span><span class="dash-pill" id="dash-motors-state">--</span></div>
+          <div class="dash-value" id="dash-motors-value">--</div>
+          <div class="dash-meta" id="dash-motors-meta">--</div>
+        </div>
+        <div class="dash-card" id="dash-card-display">
+          <div class="dash-card-head"><span>DISPLAY</span><span class="dash-pill" id="dash-display-state">--</span></div>
+          <div class="dash-value" id="dash-display-value">--</div>
+          <div class="dash-meta" id="dash-display-meta">--</div>
+        </div>
+        <div class="dash-card" id="dash-card-camera">
+          <div class="dash-card-head"><span>CAMERA</span><span class="dash-pill" id="dash-camera-state">--</span></div>
+          <div class="dash-value" id="dash-camera-value">--</div>
+          <div class="dash-meta" id="dash-camera-meta">--</div>
+        </div>
+        <div class="dash-card" id="dash-card-audio">
+          <div class="dash-card-head"><span>AUDIO</span><span class="dash-pill" id="dash-audio-state">--</span></div>
+          <div class="dash-value" id="dash-audio-value">--</div>
+          <div class="dash-meta" id="dash-audio-meta">--</div>
+        </div>
+        <div class="dash-card" id="dash-card-python">
+          <div class="dash-card-head"><span>PYTHON RUNNER</span><span class="dash-pill" id="dash-python-state">--</span></div>
+          <div class="dash-value" id="dash-python-value">--</div>
+          <div class="dash-meta" id="dash-python-meta">--</div>
+        </div>
+        <div class="dash-card" id="dash-card-sensors">
+          <div class="dash-card-head"><span>SENSORS</span><span class="dash-pill" id="dash-sensors-state">--</span></div>
+          <div class="dash-value" id="dash-sensors-value">--</div>
+          <div class="dash-meta" id="dash-sensors-meta">--</div>
+        </div>
+      </div>
+
+      <div class="section-divider">LIVE MOTOR POSITIONS</div>
+      <div class="dash-motor-grid">
+        <div><span>L-TRACK</span><strong id="dash-motor-0">--</strong></div>
+        <div><span>R-TRACK</span><strong id="dash-motor-1">--</strong></div>
+        <div><span>LIFT</span><strong id="dash-motor-2">--</strong></div>
+        <div><span>HEAD</span><strong id="dash-motor-3">--</strong></div>
+      </div>
     </div>
 
     <!-- ── Tab: MOTORS ── -->
-    <div class="tab-pane active panel" id="tab-motors">
+    <div class="tab-pane panel" id="tab-motors">
       <div class="two-col-row">
         <!-- Left: sliders -->
         <div class="slider-stack">
@@ -130,6 +212,7 @@
 
       <!-- Encoder state -->
       <div class="section-divider">ENCODER STATE</div>
+      <button class="btn" style="width:100%;margin-bottom:6px;font-size:11px;padding:5px" id="btn-zero-encoders">ZERO ENCODER VIEW</button>
       <div class="encoder-grid" id="encoder-grid">
         <div class="enc-row" id="enc-0">
           <span class="enc-name">L-TRACK</span>
@@ -257,6 +340,33 @@
       </div>
     </div>
 
+    <!-- ── Tab: ANIMATIONS ── -->
+    <div class="tab-pane panel" id="tab-animations">
+      <div class="panel-title">DDL ANIMATIONS</div>
+      <div class="animation-toolbar">
+        <input type="search" id="anim-filter" class="anim-filter" placeholder="Filter clips or groups..." spellcheck="false" />
+        <button class="btn" id="btn-anim-refresh">REFRESH</button>
+      </div>
+      <div class="animation-meta-row">
+        <span id="anim-root">root: --</span>
+        <span id="anim-count">0 items</span>
+      </div>
+      <div id="anim-list" class="animation-list">
+        <div class="anim-empty">No animations loaded.</div>
+      </div>
+      <div class="section-divider">PLAYBACK</div>
+      <div class="animation-selected">
+        <span class="stat-l">SELECTED</span>
+        <span class="val" id="anim-selected">--</span>
+      </div>
+      <div class="media-row">
+        <button class="btn primary" id="btn-anim-play" disabled>▶ PLAY ANIMATION</button>
+        <button class="btn danger" id="btn-anim-stop">■ STOP</button>
+      </div>
+      <div class="stat"><span class="stat-l">STATUS</span><span class="val" id="anim-status">READY</span></div>
+      <div id="anim-output" class="animation-output">Playback output will appear here.</div>
+    </div>
+
     <!-- ── Tab: VIDEOS ── -->
     <div class="tab-pane panel" id="tab-videos">
       <div class="panel-title">VIDEO MANAGER</div>
@@ -283,6 +393,21 @@
       <div class="stat"><span class="stat-l">STATUS</span><span class="val" id="vvid-upload-status">READY</span></div>
     </div>
 
+    <!-- ── Tab: DEVELOPER ── -->
+    <div class="tab-pane panel" id="tab-developer">
+      <div class="panel-title">PYTHON SCRIPT RUNNER</div>
+      <div class="media-row">
+        <textarea id="dev-script-editor" placeholder="# Write your python script here...&#10;from vector_robot import VectorRobot&#10;import time&#10;&#10;robot = VectorRobot()&#10;print('Hello from Vector!')&#10;" spellcheck="false" style="width:100%; height:180px; font-family:'JetBrains Mono',monospace; font-size:11px; background:rgba(0,0,0,0.3); border:1px solid rgba(0,238,255,0.2); color:#fff; padding:8px; border-radius:4px; resize:vertical;"></textarea>
+      </div>
+      <div class="media-row" style="margin-top:8px">
+        <input type="file" id="dev-script-file" accept=".py" style="flex:1;font-size:11px" />
+        <button class="btn primary" id="btn-dev-run">▶ RUN SCRIPT</button>
+        <button class="btn danger" id="btn-dev-stop" disabled style="margin-left:6px">⏹ STOP</button>
+      </div>
+      <div class="section-divider">SCRIPT OUTPUT CONSOLE</div>
+      <div id="dev-console" style="background:#050a14; border:1px solid rgba(0,238,255,0.1); border-radius:4px; height:180px; overflow-y:auto; padding:8px; font-family:'JetBrains Mono',monospace; font-size:11px; color:#39ff6e; white-space:pre-wrap; word-break:break-all;">Console output will appear here in real-time...</div>
+    </div>
+
   </section>
 
   <!-- ── RIGHT: Sensors ── -->
@@ -302,6 +427,7 @@
     <div class="section-divider">TOUCH</div>
     <div class="stat"><span class="stat-l">TOUCH 0</span><span class="val" id="vt0">--</span></div>
     <div class="stat"><span class="stat-l">TOUCH 1</span><span class="faulty-badge">N/A</span></div>
+    <div class="stat"><span class="stat-l">POWER BUTTON</span><span class="val" id="vback-btn">--</span></div>
 
     <div class="section-divider">PROXIMITY (TOF)</div>
     <div class="stat"><span class="stat-l">DISTANCE</span><span class="val" id="vprox-dist">--</span></div>

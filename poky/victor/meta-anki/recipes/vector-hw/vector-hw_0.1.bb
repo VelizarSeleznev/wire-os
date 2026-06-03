@@ -3,7 +3,7 @@ LICENSE = "CLOSED"
 PR = "r1"
 
 DEPENDS += "openssl"
-RDEPENDS:vector-hw-api += "bash"
+RDEPENDS:vector-hw-api += "bash python3 python3-core python3-json python3-netclient"
 RDEPENDS:vector-hw-cli += "curl"
 RDEPENDS:vector-app-runner += "bash jq systemd tar gzip"
 
@@ -54,6 +54,13 @@ do_install() {
 	install -d ${D}${systemd_system_unitdir}/vector-hw.target.wants
 	ln -sf ../vector-hw-api.service ${D}${systemd_system_unitdir}/vector-hw.target.wants/vector-hw-api.service
 	ln -sf ../vector-app-runner.service ${D}${systemd_system_unitdir}/vector-hw.target.wants/vector-app-runner.service
+
+	# The hardware image owns devices through vector-hw-api. Mask the stock
+	# engine if it exists in the base rootfs so it cannot grab GPIO/Spine or
+	# show crash UI during boot.
+	ln -sf /dev/null ${D}${systemd_system_unitdir}/vic-engine.service
+	ln -sf /dev/null ${D}${systemd_system_unitdir}/vic-bootAnim.service
+	ln -sf /dev/null ${D}${systemd_system_unitdir}/vic-anim.service
 }
 
 FILES:vector-hw-api = " \
@@ -61,6 +68,9 @@ FILES:vector-hw-api = " \
 	${systemd_system_unitdir}/vector-hw-api.service \
 	${systemd_system_unitdir}/vector-hw-stop-motors.service \
 	${systemd_system_unitdir}/vector-hw.target \
+	${systemd_system_unitdir}/vic-engine.service \
+	${systemd_system_unitdir}/vic-bootAnim.service \
+	${systemd_system_unitdir}/vic-anim.service \
 	${systemd_system_unitdir}/multi-user.target.wants/vector-hw.target \
 	${systemd_system_unitdir}/vector-hw.target.wants/vector-hw-api.service \
 "

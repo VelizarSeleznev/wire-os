@@ -14,6 +14,28 @@ def print_json(value: object) -> None:
     print(json.dumps(value, indent=2, sort_keys=True))
 
 
+def filtered_animations(robot: VectorRobot, needle: str, limit: int) -> dict[str, object]:
+    data = robot.animations.list()
+    needle = needle.strip().lower()
+    limit = max(1, min(int(limit), 500))
+
+    def keep(item: dict[str, object]) -> bool:
+        return (
+            not needle
+            or needle in str(item.get("name", "")).lower()
+            or needle in str(item.get("path", "")).lower()
+            or any(needle in str(clip).lower() for clip in item.get("clips", []))
+        )
+
+    return {
+        "root": data["root"],
+        "total_clips": len(data["clips"]),
+        "total_groups": len(data["groups"]),
+        "clips": [item for item in data["clips"] if keep(item)][:limit],
+        "groups": [item for item in data["groups"] if keep(item)][:limit],
+    }
+
+
 def main() -> int:
     p = argparse.ArgumentParser(prog="vectorctl")
     p.add_argument("--host", default="192.168.1.89")
@@ -28,6 +50,8 @@ def main() -> int:
     move.add_argument("motor", type=int, choices=range(4))
     move.add_argument("ticks", type=int)
     move.add_argument("--power", type=float, default=0.5)
+    move.add_argument("--wait", action="store_true")
+    move.add_argument("--timeout", type=float, default=12.0)
     drive = sub.add_parser("drive")
     drive.add_argument("ticks", type=int)
     drive.add_argument("--power", type=float, default=0.35)
@@ -59,6 +83,20 @@ def main() -> int:
     snap = sub.add_parser("snapshot")
     snap.add_argument("out", nargs="?", default="vector-snapshot.bmp")
 
+    run_p = sub.add_parser("run")
+    run_p.add_argument("script", help="Path to local Python script to execute on the robot")
+
+    animations = sub.add_parser("animations", help="List/play DDL vector-animations-build assets")
+    anim_sub = animations.add_subparsers(dest="anim_cmd", required=True)
+    anim_list = anim_sub.add_parser("list", help="List available DDL clips and groups")
+    anim_list.add_argument("--filter", default="", help="Case-insensitive substring filter")
+    anim_list.add_argument("--limit", type=int, default=40, help="Maximum clips and maximum groups to print")
+    anim_play = anim_sub.add_parser("play", help="Play a DDL clip or animation group")
+    anim_play.add_argument("name", help="Clip name, group name, or asset path")
+    anim_play.add_argument("--kind", choices=("clip", "group"), default="clip")
+    anim_stop = anim_sub.add_parser("stop", help="Stop active animation motors/audio")
+    anim_stop.set_defaults(_animation_stop=True)
+
     args = p.parse_args()
     robot = VectorRobot(args.host, args.port)
 
@@ -69,7 +107,10 @@ def main() -> int:
     elif args.cmd == "motors":
         print_json(robot.motors_state())
     elif args.cmd == "move":
-        print_json(robot.move_motor(args.motor, args.ticks, args.power))
+        if args.wait:
+            print_json(robot.move_motor_and_wait(args.motor, args.ticks, args.power, args.timeout))
+        else:
+            print_json(robot.move_motor(args.motor, args.ticks, args.power))
     elif args.cmd == "drive":
         print_json(robot.drive_straight(args.ticks, args.power, args.timeout_ms))
     elif args.cmd == "hold":
@@ -86,6 +127,29 @@ def main() -> int:
         out = Path(args.out)
         robot.camera_snapshot(out)
         print_json({"ok": True, "path": str(out), "bytes": out.stat().st_size})
+    elif args.cmd == "run":
+        script_path = Path(args.script)
+        if not script_path.exists():
+            print(f"Error: local file '{script_path}' not found")
+            return 1
+        script_content = script_path.read_bytes()
+        print(f"Uploading and running {script_path.name} on the robot...")
+        try:
+            robot.run_script(script_content)
+        except KeyboardInterrupt:
+            print("\nExecution interrupted by user.")
+        except Exception as exc:
+            print(f"Error: {exc}")
+            return 1
+    elif args.cmd == "animations":
+        if args.anim_cmd == "list":
+            print_json(filtered_animations(robot, args.filter, args.limit))
+        elif args.anim_cmd == "play":
+            result = robot.animations.play(args.name, kind=args.kind)
+            print_json(result)
+            return 0 if result.get("ok") else 1
+        elif args.anim_cmd == "stop":
+            print_json(robot.animations.stop())
     return 0
 
 
