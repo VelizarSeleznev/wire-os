@@ -14,6 +14,8 @@ Before changing code, read:
 - `docs/project-workspace.md`
 - `docs/vector-hw-image.md`
 - `docs/vector-hardware-status.md`
+- `docs/seggver-runtime.md` when touching web UI, MCP, TTS, server deployment,
+  or other non-robot runtime tooling
 - `docs/vector-web-ui.md` when touching the browser control UI
 
 When hardware support, API behavior, robot validation, build artifacts, or UI
@@ -30,6 +32,9 @@ understood without re-reading implementation code.
   `/Volumes/wire-os-cs/wire-os/build/hwdev-artifacts`
 - Companion control UI source:
   `tools/vector-web-ui`
+- Always-on server runtime:
+  `egg@seggver:/home/egg/wire-os-runtime`, deployed from this checkout with
+  `scripts/seggver-runtime.sh`
 
 The case-sensitive checkout exists because the Linux 3.18 tree contains paths
 that differ only by case. Do not run full kernel/image builds from a
@@ -81,3 +86,12 @@ VECTOR_ROBOT_IP=<robot-ip> bun run dev
 ```
 
 Default URL: `http://localhost:3000`.
+
+For normal use and agent validation, prefer the server runtime instead of a
+local laptop port:
+
+```sh
+scripts/seggver-runtime.sh
+```
+
+Stable LAN URL: `http://192.168.1.63:9786/`.
